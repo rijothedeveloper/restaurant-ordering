@@ -49,3 +49,13 @@ confirm the details, and pay when collecting it.
 
 Phase 1, Lesson 1: repository, project structure, and MVP scope.
 Python dependencies and the FastAPI application are added in Lesson 2.
+
+
+
+| Task | Command |
+|---|---|
+| Start database | `docker compose up -d --wait --wait-timeout 60 db` |
+| Check status | `docker compose ps` |
+| View logs | `docker compose logs --tail=100 db` |
+| Stop database | `docker compose stop db` |
+| Remove container while retaining data | `docker compose down` |
