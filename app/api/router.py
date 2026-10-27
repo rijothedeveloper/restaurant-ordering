@@ -9,3 +9,8 @@ async def root() -> dict[str, str]:
         "service": "restaurant-ordering",
         "message": "API is running",
     }
+
+
+@router.get("/health", tags=["system"])
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
