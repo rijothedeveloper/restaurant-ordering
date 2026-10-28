@@ -1,6 +1,7 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import asyncpg
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -24,7 +25,10 @@ def settings() -> Settings:
 
 @pytest.fixture
 def pool_factory(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    pool = SimpleNamespace(close=AsyncMock())
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=1))
+    acquire = MagicMock()
+    acquire.return_value.__aenter__.return_value = connection
+    pool = SimpleNamespace(close=AsyncMock(), acquire=acquire)
     factory = AsyncMock(return_value=pool)
     monkeypatch.setattr("app.db.pool.asyncpg.create_pool", factory)
     return factory
@@ -72,3 +76,51 @@ def test_database_failure_prevents_startup(
     with pytest.raises(OSError, match="Database unavailable"):
         with TestClient(app):
             pytest.fail("Startup should have failed")
+
+
+def test_ready_returns_200(settings: Settings, pool_factory: AsyncMock) -> None:
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("internal timeout"),
+        OSError("internal network detail"),
+        asyncpg.PostgresError("internal database detail"),
+        asyncpg.InterfaceError("internal connection detail"),
+    ],
+)
+def test_ready_failure_preserves_liveness(
+    settings: Settings, pool_factory: AsyncMock, error: Exception
+) -> None:
+    pool = pool_factory.return_value
+    connection = pool.acquire.return_value.__aenter__.return_value
+    connection.fetchval.side_effect = error
+
+    with TestClient(create_app(settings)) as client:
+        ready_response = client.get("/ready")
+        health_response = client.get("/health")
+
+    assert ready_response.status_code == 503
+    assert ready_response.json() == {"status": "not_ready"}
+    assert health_response.status_code == 200
+    assert health_response.json() == {"status": "ok"}
+
+
+def test_ready_handles_pool_exhaustion(
+    settings: Settings, pool_factory: AsyncMock
+) -> None:
+    pool = pool_factory.return_value
+    pool.acquire.return_value.__aenter__.side_effect = TimeoutError()
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}

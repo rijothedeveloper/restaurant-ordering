@@ -18,6 +18,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = ["integration: requires a migrated restaurant_test database"]
 
 [tool.ruff]
 target-version = "py312"
