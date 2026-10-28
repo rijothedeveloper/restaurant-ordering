@@ -12,6 +12,7 @@ from pydantic import SecretStr
 
 from app.config import Settings
 from app.main import create_app
+from app.repositories.restaurant_config import RestaurantConfigurationRepository
 from app.repositories.restaurants import RestaurantRepository
 
 pytestmark = pytest.mark.integration
@@ -109,5 +110,82 @@ def test_database_rejects_blank_names(database_settings: Settings, name: str) ->
                         await repository.create(name)
 
                 assert await connection.fetchval("SELECT 1") == 1
+
+    asyncio.run(scenario())
+
+
+def test_location_configuration_and_scope(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with database_app(database_settings) as app:
+            async with app.state.db_pool.acquire(timeout=5) as connection:
+                transaction = connection.transaction()
+                await transaction.start()
+                try:
+                    restaurant = await RestaurantRepository(connection).create(
+                        "Configuration test"
+                    )
+                    location_id = await connection.fetchval(
+                        """
+                        INSERT INTO public.locations (restaurant_id, name, timezone)
+                        VALUES ($1, $2, $3)
+                        RETURNING id
+                        """,
+                        restaurant.id,
+                        "Main",
+                        "America/Los_Angeles",
+                    )
+                    repository = RestaurantConfigurationRepository(connection)
+                    empty = await repository.get(restaurant.id, location_id)
+                    assert empty is not None
+                    assert empty.hours == []
+                    assert empty.ordering_enabled is False
+
+                    await connection.execute(
+                        """
+                        INSERT INTO public.location_hours
+                            (location_id, weekday, opens_minute, closes_minute)
+                        VALUES ($1, 0, 660, 900), ($1, 0, 1020, 1260)
+                        """,
+                        location_id,
+                    )
+                    config = await repository.get(restaurant.id, location_id)
+                    assert config is not None
+                    assert config.currency == "USD"
+                    assert config.preparation_minutes == 20
+                    assert len(config.hours) == 2
+                    assert await repository.get(uuid4(), location_id) is None
+                    assert await repository.get(restaurant.id, uuid4()) is None
+
+                    with pytest.raises(asyncpg.ExclusionViolationError):
+                        async with connection.transaction():
+                            await connection.execute(
+                                """
+                                INSERT INTO public.location_hours
+                                    (location_id, weekday, opens_minute, closes_minute)
+                                VALUES ($1, 0, 850, 1000)
+                                """,
+                                location_id,
+                            )
+
+                    await connection.execute(
+                        """
+                        INSERT INTO public.location_hours
+                            (location_id, weekday, opens_minute, closes_minute)
+                        VALUES ($1, 0, 900, 1020)
+                        """,
+                        location_id,
+                    )
+                    with pytest.raises(asyncpg.CheckViolationError):
+                        async with connection.transaction():
+                            await connection.execute(
+                                """
+                                INSERT INTO public.location_hours
+                                    (location_id, weekday, opens_minute, closes_minute)
+                                VALUES ($1, 1, 100, 100)
+                                """,
+                                location_id,
+                            )
+                finally:
+                    await transaction.rollback()
 
     asyncio.run(scenario())
