@@ -1,11 +1,13 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Self
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+RESTAURANT_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 
 class Settings(BaseSettings):

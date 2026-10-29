@@ -1,6 +1,6 @@
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
+from app.config import RESTAURANT_TIMEZONE
 from app.schemas.restaurant_config import RestaurantConfiguration
 
 
@@ -8,7 +8,7 @@ def is_open_now(config: RestaurantConfiguration, at: datetime) -> bool:
     if at.tzinfo is None or at.utcoffset() is None:
         raise ValueError("Pass a timezone-aware datetime")
 
-    local = at.astimezone(ZoneInfo(config.timezone))
+    local = at.astimezone(RESTAURANT_TIMEZONE)
     minute = local.hour * 60 + local.minute
     return any(
         period.weekday == local.weekday()

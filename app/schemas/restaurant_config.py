@@ -1,8 +1,6 @@
-from typing import Literal, Self
-from uuid import UUID
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 class OpeningPeriod(BaseModel):
@@ -18,24 +16,10 @@ class OpeningPeriod(BaseModel):
 
 
 class RestaurantConfiguration(BaseModel):
-    restaurant_id: UUID
     restaurant_name: str
-    location_id: UUID
-    location_name: str
-    timezone: str
-    currency: Literal["USD"]
     preparation_minutes: int = Field(ge=1, le=180)
     ordering_enabled: bool
     hours: list[OpeningPeriod] = Field(default_factory=list)
-
-    @field_validator("timezone")
-    @classmethod
-    def validate_timezone(cls, value: str) -> str:
-        try:
-            ZoneInfo(value)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError("Use a valid IANA timezone") from exc
-        return value
 
     @model_validator(mode="after")
     def validate_hours(self) -> Self:

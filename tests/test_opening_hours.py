@@ -1,5 +1,4 @@
 from datetime import datetime
-from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -10,12 +9,7 @@ from app.services.opening_hours import is_open_now
 
 def make_config(**changes: object) -> RestaurantConfiguration:
     data = {
-        "restaurant_id": uuid4(),
         "restaurant_name": "Test Kitchen",
-        "location_id": uuid4(),
-        "location_name": "Main",
-        "timezone": "America/Los_Angeles",
-        "currency": "USD",
         "preparation_minutes": 20,
         "ordering_enabled": False,
         "hours": [{"weekday": 0, "opens_minute": 660, "closes_minute": 1260}],
@@ -59,9 +53,8 @@ def test_invalid_periods_are_rejected(period: dict[str, int]) -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"timezone": "Not/A_Real_Zone"},
-        {"currency": "EUR"},
         {"preparation_minutes": 0},
+        {"preparation_minutes": 181},
     ],
 )
 def test_invalid_configuration_is_rejected(changes: dict[str, object]) -> None:
