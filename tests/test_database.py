@@ -52,6 +52,8 @@ async def isolated_data(settings: Settings) -> AsyncIterator[asyncpg.Connection]
             await transaction.start()
 
             try:
+                await connection.execute("DELETE FROM public.modifier_options")
+                await connection.execute("DELETE FROM public.modifier_groups")
                 await connection.execute("DELETE FROM public.menu_items")
                 await connection.execute("DELETE FROM public.menu_categories")
                 await connection.execute("DELETE FROM public.opening_hours")
@@ -284,6 +286,7 @@ def test_menu_and_constraints(database_settings: Settings) -> None:
 def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
     async def scenario() -> None:
         category_id, item_id = uuid4(), uuid4()
+        group_id, option_id = uuid4(), uuid4()
         created_settings = False
 
         try:
@@ -313,6 +316,26 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
                             category_id,
                         )
 
+                        await connection.execute(
+                            """
+                            INSERT INTO public.modifier_groups
+                                (id, menu_item_id, name, min_selections, max_selections)
+                            VALUES ($1, $2, 'Size', 1, 1)
+                            """,
+                            group_id,
+                            item_id,
+                        )
+
+                        await connection.execute(
+                            """
+                            INSERT INTO public.modifier_options
+                                (id, group_id, name, price_delta_cents)
+                            VALUES ($1, $2, 'Large', 300)
+                            """,
+                            option_id,
+                            group_id,
+                        )
+
                     created_settings = created is not None
 
             async with database_app(database_settings) as second_app:
@@ -337,11 +360,32 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
 
                 assert len(saved) == 1
                 assert saved[0]["price_cents"] == 1399
+                assert len(saved[0]["modifier_groups"]) == 1
+
+                group = saved[0]["modifier_groups"][0]
+                assert group["id"] == str(group_id)
+                assert (group["min_selections"], group["max_selections"]) == (1, 1)
+                assert group["options"] == [
+                    {
+                        "id": str(option_id),
+                        "name": "Large",
+                        "price_delta_cents": 300,
+                        "is_available": True,
+                    }
+                ]
 
         finally:
             async with database_app(database_settings) as cleanup_app:
                 async with cleanup_app.state.db_pool.acquire(timeout=5) as connection:
                     async with connection.transaction():
+                        await connection.execute(
+                            "DELETE FROM public.modifier_options WHERE id = $1",
+                            option_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM public.modifier_groups WHERE id = $1",
+                            group_id,
+                        )
                         await connection.execute(
                             "DELETE FROM public.menu_items WHERE id = $1",
                             item_id,
@@ -355,5 +399,156 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
                             await connection.execute(
                                 "DELETE FROM public.restaurant_settings WHERE id = 1"
                             )
+
+    asyncio.run(scenario())
+
+
+def test_modifiers_and_constraints(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            await connection.execute(
+                "INSERT INTO public.restaurant_settings (name) VALUES ('Modifier Test')"
+            )
+
+            category_id = await connection.fetchval(
+                "INSERT INTO public.menu_categories (name) VALUES ('Mains') RETURNING id"
+            )
+
+            item_id = await connection.fetchval(
+                """
+                INSERT INTO public.menu_items
+                    (category_id, name, price_cents, sort_order)
+                VALUES ($1, 'Bowl', 1399, 10) RETURNING id
+                """,
+                category_id,
+            )
+
+            await connection.execute(
+                """
+                INSERT INTO public.menu_items
+                    (category_id, name, price_cents, sort_order)
+                VALUES ($1, 'Plain Bowl', 999, 20)
+                """,
+                category_id,
+            )
+
+            groups = {}
+            group_sql = """
+                INSERT INTO public.modifier_groups
+                    (menu_item_id, name, min_selections, max_selections, sort_order)
+                VALUES ($1, $2, $3, $4, $5) RETURNING id
+            """
+
+            for name, minimum, maximum, order in [
+                ("Extras", 0, 2, 20),
+                ("Size", 1, 1, 10),
+                ("Empty", 0, 1, 30),
+            ]:
+                groups[name] = await connection.fetchval(
+                    group_sql,
+                    item_id,
+                    name,
+                    minimum,
+                    maximum,
+                    order,
+                )
+
+            option_sql = """
+                INSERT INTO public.modifier_options
+                    (group_id, name, price_delta_cents, is_available, sort_order)
+                VALUES ($1, $2, $3, $4, $5)
+            """
+
+            for group, name, price, available, order in [
+                ("Size", "Large", 300, True, 20),
+                ("Size", "Regular", 0, True, 10),
+                ("Extras", "Cheese", 150, False, 20),
+                ("Extras", "Chicken", 400, True, 10),
+            ]:
+                await connection.execute(
+                    option_sql,
+                    groups[group],
+                    name,
+                    price,
+                    available,
+                    order,
+                )
+
+            menu = await MenuRepository(connection).get()
+            assert menu is not None
+
+            items = menu.categories[0].items
+            assert [item.name for item in items] == ["Bowl", "Plain Bowl"]
+
+            loaded = items[0].modifier_groups
+            assert [g.name for g in loaded] == ["Size", "Extras", "Empty"]
+            assert [(g.min_selections, g.max_selections) for g in loaded] == [
+                (1, 1),
+                (0, 2),
+                (0, 1),
+            ]
+
+            assert [o.name for o in loaded[0].options] == ["Regular", "Large"]
+            assert [o.price_delta_cents for o in loaded[0].options] == [0, 300]
+            assert [o.name for o in loaded[1].options] == ["Chicken", "Cheese"]
+            assert loaded[1].options[1].is_available is False
+            assert loaded[2].options == []
+            assert items[1].modifier_groups == []
+
+            for name, minimum, maximum, order in [
+                ("Bad", -1, 1, 0),
+                ("Bad", 0, 0, 0),
+                ("Bad", 2, 1, 0),
+                ("   ", 0, 1, 0),
+                ("Bad", 0, 1, -1),
+            ]:
+                with pytest.raises(asyncpg.CheckViolationError):
+                    async with connection.transaction():
+                        await connection.execute(
+                            group_sql,
+                            item_id,
+                            name,
+                            minimum,
+                            maximum,
+                            order,
+                        )
+
+            for name, price, order in [
+                ("Bad", -1, 0),
+                ("   ", 0, 0),
+                ("Bad", 0, -1),
+            ]:
+                with pytest.raises(asyncpg.CheckViolationError):
+                    async with connection.transaction():
+                        await connection.execute(
+                            option_sql,
+                            groups["Size"],
+                            name,
+                            price,
+                            True,
+                            order,
+                        )
+
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        group_sql,
+                        uuid4(),
+                        "Bad",
+                        0,
+                        1,
+                        0,
+                    )
+
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        option_sql,
+                        uuid4(),
+                        "Bad",
+                        0,
+                        True,
+                        0,
+                    )
 
     asyncio.run(scenario())

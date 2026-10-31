@@ -143,6 +143,14 @@ def test_menu_returns_single_restaurant(
         "description": None,
         "price_cents": None,
         "is_available": None,
+        "group_id": None,
+        "group_name": None,
+        "min_selections": None,
+        "max_selections": None,
+        "option_id": None,
+        "option_name": None,
+        "price_delta_cents": None,
+        "option_is_available": None,
     }
 
     item_row = dict(
@@ -192,6 +200,7 @@ def test_menu_returns_single_restaurant(
             "description": "Rice bowl",
             "price_cents": 1399,
             "is_available": False,
+            "modifier_groups": [],
         }
         assert body["categories"][1]["items"] == []
 
@@ -230,3 +239,90 @@ def test_menu_database_failure_is_503(
     assert response.status_code == 503
     assert response.json() == {"detail": "Menu temporarily unavailable"}
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_menu_returns_modifier_groups(
+    settings: Settings, pool_factory: AsyncMock
+) -> None:
+    item_id, size_id, extras_id = uuid4(), uuid4(), uuid4()
+
+    base = {
+        "restaurant_name": "Test Kitchen",
+        "ordering_enabled": False,
+        "category_id": uuid4(),
+        "category_name": "Mains",
+        "item_id": item_id,
+        "item_name": "Test Bowl",
+        "description": "Rice bowl",
+        "price_cents": 1399,
+        "is_available": True,
+        "group_id": None,
+        "group_name": None,
+        "min_selections": None,
+        "max_selections": None,
+        "option_id": None,
+        "option_name": None,
+        "price_delta_cents": None,
+        "option_is_available": None,
+    }
+
+    rows = []
+
+    for group_id, group_name, minimum, maximum, options in [
+        (size_id, "Size", 1, 1, [("Regular", 0, True), ("Large", 300, True)]),
+        (extras_id, "Extras", 0, 2, [("Chicken", 400, True), ("Cheese", 150, False)]),
+    ]:
+        for name, price, available in options:
+            rows.append(
+                dict(
+                    base,
+                    group_id=group_id,
+                    group_name=group_name,
+                    min_selections=minimum,
+                    max_selections=maximum,
+                    option_id=uuid4(),
+                    option_name=name,
+                    price_delta_cents=price,
+                    option_is_available=available,
+                )
+            )
+
+    rows.append(
+        dict(
+            base,
+            group_id=uuid4(),
+            group_name="Empty",
+            min_selections=0,
+            max_selections=1,
+        )
+    )
+    rows.append(dict(base, item_id=uuid4(), item_name="Plain Bowl"))
+
+    connection = pool_factory.return_value.acquire.return_value.__aenter__.return_value
+    connection.fetch = AsyncMock(return_value=rows)
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/menu")
+
+    assert response.status_code == 200
+
+    items = response.json()["categories"][0]["items"]
+    assert [item["name"] for item in items] == ["Test Bowl", "Plain Bowl"]
+
+    groups = items[0]["modifier_groups"]
+    assert [group["name"] for group in groups] == ["Size", "Extras", "Empty"]
+    assert [(g["min_selections"], g["max_selections"]) for g in groups] == [
+        (1, 1),
+        (0, 2),
+        (0, 1),
+    ]
+
+    assert [o["name"] for o in groups[0]["options"]] == ["Regular", "Large"]
+    assert [o["price_delta_cents"] for o in groups[0]["options"]] == [0, 300]
+
+    assert len(groups[1]["options"]) == 2
+    assert groups[1]["options"][1]["is_available"] is False
+    assert groups[2]["options"] == []
+    assert items[1]["modifier_groups"] == []
+
+    connection.fetch.assert_awaited_once()
