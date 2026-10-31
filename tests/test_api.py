@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -124,3 +125,108 @@ def test_ready_handles_pool_exhaustion(
 
     assert response.status_code == 503
     assert response.json() == {"status": "not_ready"}
+
+
+@pytest.mark.parametrize("empty_menu", [False, True])
+def test_menu_returns_single_restaurant(
+    settings: Settings, pool_factory: AsyncMock, empty_menu: bool
+) -> None:
+    category_id, item_id = uuid4(), uuid4()
+
+    empty_row = {
+        "restaurant_name": "Test Kitchen",
+        "ordering_enabled": False,
+        "category_id": None,
+        "category_name": None,
+        "item_id": None,
+        "item_name": None,
+        "description": None,
+        "price_cents": None,
+        "is_available": None,
+    }
+
+    item_row = dict(
+        empty_row,
+        category_id=category_id,
+        category_name="Mains",
+        item_id=item_id,
+        item_name="Test Bowl",
+        description="Rice bowl",
+        price_cents=1399,
+        is_available=False,
+    )
+
+    rows = (
+        [empty_row]
+        if empty_menu
+        else [
+            item_row,
+            dict(item_row, item_id=uuid4(), item_name="Second Bowl"),
+            dict(empty_row, category_id=uuid4(), category_name="Drinks"),
+        ]
+    )
+
+    connection = pool_factory.return_value.acquire.return_value.__aenter__.return_value
+    connection.fetch = AsyncMock(return_value=rows)
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/menu")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+
+    body = response.json()
+    assert body["restaurant_name"] == "Test Kitchen"
+    assert body["currency"] == "USD"
+    assert body["ordering_enabled"] is False
+    assert "restaurant_id" not in body and "location_id" not in body
+
+    if empty_menu:
+        assert body["categories"] == []
+    else:
+        assert [c["name"] for c in body["categories"]] == ["Mains", "Drinks"]
+        assert len(body["categories"][0]["items"]) == 2
+        assert body["categories"][0]["items"][0] == {
+            "id": str(item_id),
+            "name": "Test Bowl",
+            "description": "Rice bowl",
+            "price_cents": 1399,
+            "is_available": False,
+        }
+        assert body["categories"][1]["items"] == []
+
+
+def test_menu_requires_restaurant_settings(
+    settings: Settings, pool_factory: AsyncMock
+) -> None:
+    connection = pool_factory.return_value.acquire.return_value.__aenter__.return_value
+    connection.fetch = AsyncMock(return_value=[])
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/menu")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Restaurant is not configured"}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("private timeout detail"),
+        OSError("private network detail"),
+        asyncpg.PostgresConnectionError("private database detail"),
+        asyncpg.InterfaceError("private connection detail"),
+    ],
+)
+def test_menu_database_failure_is_503(
+    settings: Settings, pool_factory: AsyncMock, error: Exception
+) -> None:
+    connection = pool_factory.return_value.acquire.return_value.__aenter__.return_value
+    connection.fetch = AsyncMock(side_effect=error)
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/menu")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Menu temporarily unavailable"}
+    assert response.headers["cache-control"] == "no-store"

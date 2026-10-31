@@ -2,6 +2,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -11,6 +12,7 @@ from pydantic import SecretStr
 
 from app.config import Settings
 from app.main import create_app
+from app.repositories.menu import MenuRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
 
 pytestmark = pytest.mark.integration
@@ -48,7 +50,10 @@ async def isolated_data(settings: Settings) -> AsyncIterator[asyncpg.Connection]
         async with app.state.db_pool.acquire(timeout=5) as connection:
             transaction = connection.transaction()
             await transaction.start()
+
             try:
+                await connection.execute("DELETE FROM public.menu_items")
+                await connection.execute("DELETE FROM public.menu_categories")
                 await connection.execute("DELETE FROM public.opening_hours")
                 await connection.execute("DELETE FROM public.restaurant_settings")
                 yield connection
@@ -184,6 +189,169 @@ def test_committed_settings_survive_new_app(database_settings: Settings) -> None
                                 "DELETE FROM public.opening_hours "
                                 "WHERE weekday = 0 AND opens_minute = 660"
                             )
+                            await connection.execute(
+                                "DELETE FROM public.restaurant_settings WHERE id = 1"
+                            )
+
+    asyncio.run(scenario())
+
+
+def test_menu_and_constraints(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            repository = MenuRepository(connection)
+
+            assert await repository.get() is None
+
+            await connection.execute(
+                "INSERT INTO public.restaurant_settings (name) VALUES ('Menu Test')"
+            )
+
+            empty = await repository.get()
+            assert empty is not None and empty.categories == []
+
+            categories = {}
+
+            for name, order in [("Drinks", 20), ("Mains", 10), ("Empty", 30)]:
+                categories[name] = await connection.fetchval(
+                    "INSERT INTO public.menu_categories (name, sort_order) VALUES ($1, $2) RETURNING id",
+                    name,
+                    order,
+                )
+
+            sql = """
+                INSERT INTO public.menu_items
+                    (category_id, name, price_cents, is_available, sort_order)
+                VALUES ($1, $2, $3, $4, $5)
+            """
+
+            for category, name, price, available, order in [
+                ("Mains", "Second Bowl", 1399, True, 20),
+                ("Mains", "First Bowl", 1199, False, 10),
+                ("Drinks", "Water", 0, True, 10),
+            ]:
+                await connection.execute(
+                    sql,
+                    categories[category],
+                    name,
+                    price,
+                    available,
+                    order,
+                )
+
+            menu = await repository.get()
+
+            assert menu is not None
+            assert [c.name for c in menu.categories] == [
+                "Mains",
+                "Drinks",
+                "Empty",
+            ]
+            assert [i.name for i in menu.categories[0].items] == [
+                "First Bowl",
+                "Second Bowl",
+            ]
+            assert menu.categories[0].items[0].is_available is False
+            assert menu.categories[1].items[0].price_cents == 0
+            assert menu.categories[2].items == []
+
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        sql,
+                        uuid4(),
+                        "Bad category",
+                        100,
+                        True,
+                        0,
+                    )
+
+            for name, price in [("Negative price", -1), ("   ", 100)]:
+                with pytest.raises(asyncpg.CheckViolationError):
+                    async with connection.transaction():
+                        await connection.execute(
+                            sql,
+                            categories["Mains"],
+                            name,
+                            price,
+                            True,
+                            0,
+                        )
+
+    asyncio.run(scenario())
+
+
+def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        category_id, item_id = uuid4(), uuid4()
+        created_settings = False
+
+        try:
+            async with database_app(database_settings) as first_app:
+                async with first_app.state.db_pool.acquire(timeout=5) as connection:
+                    async with connection.transaction():
+                        created = await connection.fetchval(
+                            """
+                            INSERT INTO public.restaurant_settings (name)
+                            VALUES ('Persistence Test')
+                            ON CONFLICT (id) DO NOTHING RETURNING id
+                            """
+                        )
+
+                        await connection.execute(
+                            "INSERT INTO public.menu_categories (id, name) VALUES ($1, 'Persistence')",
+                            category_id,
+                        )
+
+                        await connection.execute(
+                            """
+                            INSERT INTO public.menu_items
+                                (id, category_id, name, price_cents)
+                            VALUES ($1, $2, 'Saved Bowl', 1399)
+                            """,
+                            item_id,
+                            category_id,
+                        )
+
+                    created_settings = created is not None
+
+            async with database_app(database_settings) as second_app:
+                async with AsyncClient(
+                    transport=ASGITransport(app=second_app),
+                    base_url="http://test",
+                ) as client:
+                    response = await client.get("/menu")
+
+                assert response.status_code == 200
+
+                body = response.json()
+                assert body["currency"] == "USD"
+                assert "restaurant_id" not in body and "location_id" not in body
+
+                saved = [
+                    item
+                    for category in body["categories"]
+                    for item in category["items"]
+                    if item["id"] == str(item_id)
+                ]
+
+                assert len(saved) == 1
+                assert saved[0]["price_cents"] == 1399
+
+        finally:
+            async with database_app(database_settings) as cleanup_app:
+                async with cleanup_app.state.db_pool.acquire(timeout=5) as connection:
+                    async with connection.transaction():
+                        await connection.execute(
+                            "DELETE FROM public.menu_items WHERE id = $1",
+                            item_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM public.menu_categories WHERE id = $1",
+                            category_id,
+                        )
+
+                        if created_settings:
                             await connection.execute(
                                 "DELETE FROM public.restaurant_settings WHERE id = 1"
                             )
