@@ -9,6 +9,7 @@ from pydantic import SecretStr
 
 from app.config import Settings
 from app.main import create_app
+from app.schemas.menu import MenuResponse
 
 
 @pytest.fixture
@@ -326,3 +327,113 @@ def test_menu_returns_modifier_groups(
     assert items[1]["modifier_groups"] == []
 
     connection.fetch.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "case,status,code",
+    [
+        ("valid", 200, None),
+        ("required", 422, "too_few_options"),
+        ("missing_item", 404, "item_not_found"),
+        ("duplicate", 422, "duplicate_option"),
+        ("unavailable", 422, "option_unavailable"),
+        ("client_price", 422, None),
+        ("bad_uuid", 422, None),
+        ("database_failure", 503, None),
+        ("missing_settings", 503, None),
+    ],
+)
+def test_selection_endpoint(
+    settings: Settings,
+    pool_factory: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    status: int,
+    code: str | None,
+) -> None:
+    item_id, option_id = uuid4(), uuid4()
+
+    menu = MenuResponse.model_validate(
+        {
+            "restaurant_name": "Test Kitchen",
+            "ordering_enabled": False,
+            "categories": [
+                {
+                    "id": uuid4(),
+                    "name": "Mains",
+                    "items": [
+                        {
+                            "id": item_id,
+                            "name": "Bowl",
+                            "description": "",
+                            "price_cents": 1399,
+                            "is_available": True,
+                            "modifier_groups": [
+                                {
+                                    "id": uuid4(),
+                                    "name": "Size",
+                                    "min_selections": 1,
+                                    "max_selections": 1,
+                                    "options": [
+                                        {
+                                            "id": option_id,
+                                            "name": "Large",
+                                            "price_delta_cents": 300,
+                                            "is_available": case != "unavailable",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    fetch = AsyncMock(return_value=None if case == "missing_settings" else menu)
+
+    if case == "database_failure":
+        fetch.side_effect = OSError("private connection details")
+
+    monkeypatch.setattr("app.api.menu.MenuRepository.get", fetch)
+
+    body = {
+        "item_id": str(item_id),
+        "option_ids": [str(option_id)],
+    }
+
+    if case == "required":
+        body["option_ids"] = []
+    elif case == "missing_item":
+        body["item_id"] = str(uuid4())
+    elif case == "duplicate":
+        body["option_ids"] = [str(option_id), str(option_id)]
+    elif case == "client_price":
+        body["unit_price_cents"] = 0
+    elif case == "bad_uuid":
+        body["item_id"] = "not-a-uuid"
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/menu/validate-selection",
+            json=body,
+        )
+
+    assert response.status_code == status
+
+    if case in {"client_price", "bad_uuid"}:
+        fetch.assert_not_awaited()
+        assert isinstance(response.json()["detail"], list)
+    else:
+        assert response.headers["cache-control"] == "no-store"
+
+        if status == 200:
+            assert response.json()["unit_price_cents"] == 1699
+            assert response.json()["options"][0]["id"] == str(option_id)
+        elif code is not None:
+            assert response.json()["detail"]["code"] == code
+        elif case == "database_failure":
+            assert response.json() == {"detail": "Menu temporarily unavailable"}
+        else:
+            assert response.json() == {"detail": "Restaurant is not configured"}

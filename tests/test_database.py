@@ -13,7 +13,10 @@ from pydantic import SecretStr
 from app.config import Settings
 from app.main import create_app
 from app.repositories.menu import MenuRepository
+from app.repositories.menu_admin import MenuAdminRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
+from app.schemas.selection import SelectionRequest
+from app.services.menu_selection import SelectionError, validate_selection
 
 pytestmark = pytest.mark.integration
 
@@ -23,6 +26,7 @@ def database_settings() -> Settings:
     test_url = os.getenv("TEST_DATABASE_URL")
     if not test_url:
         pytest.fail("Set TEST_DATABASE_URL; use uv run --env-file .env.dbmate")
+
     return Settings(
         _env_file=None,
         environment="test",
@@ -36,11 +40,13 @@ def database_settings() -> Settings:
 @asynccontextmanager
 async def database_app(settings: Settings) -> AsyncIterator[FastAPI]:
     app = create_app(settings)
+
     async with app.router.lifespan_context(app):
         async with app.state.db_pool.acquire(timeout=5) as connection:
             actual_database = await connection.fetchval("SELECT current_database()")
             if actual_database != "restaurant_test":
                 raise RuntimeError("Integration tests require restaurant_test")
+
         yield app
 
 
@@ -67,24 +73,31 @@ def test_ready_with_postgres(database_settings: Settings) -> None:
     async def scenario() -> None:
         async with database_app(database_settings) as app:
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
+                transport=ASGITransport(app=app),
+                base_url="http://test",
             ) as client:
                 response = await client.get("/ready")
+
             assert response.status_code == 200
             assert response.json() == {"status": "ready"}
 
     asyncio.run(scenario())
 
 
-def test_singleton_settings_and_opening_hours(database_settings: Settings) -> None:
+def test_singleton_settings_and_opening_hours(
+    database_settings: Settings,
+) -> None:
     async def scenario() -> None:
         async with isolated_data(database_settings) as connection:
             repository = RestaurantConfigurationRepository(connection)
+
             assert await repository.get() is None
+
             await connection.execute(
                 "INSERT INTO public.restaurant_settings (name) VALUES ($1)",
                 "Test Kitchen",
             )
+
             config = await repository.get()
             assert config is not None
             assert config.restaurant_name == "Test Kitchen"
@@ -95,53 +108,68 @@ def test_singleton_settings_and_opening_hours(database_settings: Settings) -> No
             with pytest.raises(asyncpg.UniqueViolationError):
                 async with connection.transaction():
                     await connection.execute(
-                        "INSERT INTO public.restaurant_settings (name) VALUES ('Second')"
+                        "INSERT INTO public.restaurant_settings (name) "
+                        "VALUES ('Second')"
                     )
+
             with pytest.raises(asyncpg.CheckViolationError):
                 async with connection.transaction():
                     await connection.execute(
-                        "INSERT INTO public.restaurant_settings (id, name) VALUES (2, 'Second')"
+                        "INSERT INTO public.restaurant_settings (id, name) "
+                        "VALUES (2, 'Second')"
                     )
+
             for name in ("", "   "):
                 with pytest.raises(asyncpg.CheckViolationError):
                     async with connection.transaction():
                         await connection.execute(
-                            "UPDATE public.restaurant_settings SET name = $1 WHERE id = 1",
+                            "UPDATE public.restaurant_settings "
+                            "SET name = $1 WHERE id = 1",
                             name,
                         )
+
             for minutes in (0, 181):
                 with pytest.raises(asyncpg.CheckViolationError):
                     async with connection.transaction():
                         await connection.execute(
-                            "UPDATE public.restaurant_settings SET preparation_minutes = $1 WHERE id = 1",
+                            "UPDATE public.restaurant_settings "
+                            "SET preparation_minutes = $1 WHERE id = 1",
                             minutes,
                         )
 
             await connection.execute(
                 "INSERT INTO public.opening_hours VALUES (0, 660, 900), (0, 1020, 1260)"
             )
+
             with pytest.raises(asyncpg.ExclusionViolationError):
                 async with connection.transaction():
                     await connection.execute(
                         "INSERT INTO public.opening_hours VALUES (0, 850, 1000)"
                     )
+
             await connection.execute(
                 "INSERT INTO public.opening_hours VALUES (0, 900, 1020)"
             )
+
             with pytest.raises(asyncpg.CheckViolationError):
                 async with connection.transaction():
                     await connection.execute(
                         "INSERT INTO public.opening_hours VALUES (1, 100, 100)"
                     )
+
             loaded = await repository.get()
-            assert loaded is not None and len(loaded.hours) == 3
+            assert loaded is not None
+            assert len(loaded.hours) == 3
 
     asyncio.run(scenario())
 
 
-def test_committed_settings_survive_new_app(database_settings: Settings) -> None:
+def test_committed_settings_survive_new_app(
+    database_settings: Settings,
+) -> None:
     async def scenario() -> None:
         created = False
+
         try:
             async with database_app(database_settings) as first_app:
                 async with first_app.state.db_pool.acquire(timeout=5) as connection:
@@ -149,11 +177,13 @@ def test_committed_settings_survive_new_app(database_settings: Settings) -> None
                         "SELECT EXISTS (SELECT 1 FROM public.restaurant_settings) "
                         "OR EXISTS (SELECT 1 FROM public.opening_hours)"
                     )
+
                     if existing:
                         pytest.fail(
                             "Persistence test requires empty restaurant_test settings "
                             "and hours; existing data was left unchanged"
                         )
+
                     async with connection.transaction():
                         await connection.execute(
                             """
@@ -165,21 +195,27 @@ def test_committed_settings_survive_new_app(database_settings: Settings) -> None
                         await connection.execute(
                             "INSERT INTO public.opening_hours VALUES (0, 660, 1260)"
                         )
+
                     created = True
+
                     expected = await RestaurantConfigurationRepository(connection).get()
+
                     assert expected is not None
                     assert expected.restaurant_name == "Persistence Test"
                     assert expected.preparation_minutes == 35
                     assert expected.ordering_enabled is True
                     assert len(expected.hours) == 1
+
                     timestamp = await connection.fetchval(
                         "SELECT created_at FROM public.restaurant_settings WHERE id = 1"
                     )
                     assert timestamp.tzinfo is not None
+
             async with database_app(database_settings) as second_app:
                 async with second_app.state.db_pool.acquire(timeout=5) as connection:
                     loaded = await RestaurantConfigurationRepository(connection).get()
                     assert loaded == expected
+
         finally:
             if created:
                 async with database_app(database_settings) as cleanup_app:
@@ -210,13 +246,22 @@ def test_menu_and_constraints(database_settings: Settings) -> None:
             )
 
             empty = await repository.get()
-            assert empty is not None and empty.categories == []
+            assert empty is not None
+            assert empty.categories == []
 
             categories = {}
 
-            for name, order in [("Drinks", 20), ("Mains", 10), ("Empty", 30)]:
+            for name, order in [
+                ("Drinks", 20),
+                ("Mains", 10),
+                ("Empty", 30),
+            ]:
                 categories[name] = await connection.fetchval(
-                    "INSERT INTO public.menu_categories (name, sort_order) VALUES ($1, $2) RETURNING id",
+                    """
+                    INSERT INTO public.menu_categories (name, sort_order)
+                    VALUES ($1, $2)
+                    RETURNING id
+                    """,
                     name,
                     order,
                 )
@@ -242,7 +287,6 @@ def test_menu_and_constraints(database_settings: Settings) -> None:
                 )
 
             menu = await repository.get()
-
             assert menu is not None
             assert [c.name for c in menu.categories] == [
                 "Mains",
@@ -268,7 +312,10 @@ def test_menu_and_constraints(database_settings: Settings) -> None:
                         0,
                     )
 
-            for name, price in [("Negative price", -1), ("   ", 100)]:
+            for name, price in [
+                ("Negative price", -1),
+                ("   ", 100),
+            ]:
                 with pytest.raises(asyncpg.CheckViolationError):
                     async with connection.transaction():
                         await connection.execute(
@@ -283,7 +330,9 @@ def test_menu_and_constraints(database_settings: Settings) -> None:
     asyncio.run(scenario())
 
 
-def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
+def test_committed_menu_survives_new_app(
+    database_settings: Settings,
+) -> None:
     async def scenario() -> None:
         category_id, item_id = uuid4(), uuid4()
         group_id, option_id = uuid4(), uuid4()
@@ -297,12 +346,16 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
                             """
                             INSERT INTO public.restaurant_settings (name)
                             VALUES ('Persistence Test')
-                            ON CONFLICT (id) DO NOTHING RETURNING id
+                            ON CONFLICT (id) DO NOTHING
+                            RETURNING id
                             """
                         )
 
                         await connection.execute(
-                            "INSERT INTO public.menu_categories (id, name) VALUES ($1, 'Persistence')",
+                            """
+                            INSERT INTO public.menu_categories (id, name)
+                            VALUES ($1, 'Persistence')
+                            """,
                             category_id,
                         )
 
@@ -319,7 +372,13 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
                         await connection.execute(
                             """
                             INSERT INTO public.modifier_groups
-                                (id, menu_item_id, name, min_selections, max_selections)
+                                (
+                                    id,
+                                    menu_item_id,
+                                    name,
+                                    min_selections,
+                                    max_selections
+                                )
                             VALUES ($1, $2, 'Size', 1, 1)
                             """,
                             group_id,
@@ -338,6 +397,10 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
 
                     created_settings = created is not None
 
+                    admin = MenuAdminRepository(connection)
+                    assert await admin.update_item(item_id, 1499, None)
+                    assert await admin.update_option(option_id, 350, None)
+
             async with database_app(database_settings) as second_app:
                 async with AsyncClient(
                     transport=ASGITransport(app=second_app),
@@ -349,7 +412,8 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
 
                 body = response.json()
                 assert body["currency"] == "USD"
-                assert "restaurant_id" not in body and "location_id" not in body
+                assert "restaurant_id" not in body
+                assert "location_id" not in body
 
                 saved = [
                     item
@@ -359,17 +423,21 @@ def test_committed_menu_survives_new_app(database_settings: Settings) -> None:
                 ]
 
                 assert len(saved) == 1
-                assert saved[0]["price_cents"] == 1399
+                assert saved[0]["price_cents"] == 1499
                 assert len(saved[0]["modifier_groups"]) == 1
 
                 group = saved[0]["modifier_groups"][0]
                 assert group["id"] == str(group_id)
-                assert (group["min_selections"], group["max_selections"]) == (1, 1)
+                assert (
+                    group["min_selections"],
+                    group["max_selections"],
+                ) == (1, 1)
+
                 assert group["options"] == [
                     {
                         "id": str(option_id),
                         "name": "Large",
-                        "price_delta_cents": 300,
+                        "price_delta_cents": 350,
                         "is_available": True,
                     }
                 ]
@@ -411,14 +479,16 @@ def test_modifiers_and_constraints(database_settings: Settings) -> None:
             )
 
             category_id = await connection.fetchval(
-                "INSERT INTO public.menu_categories (name) VALUES ('Mains') RETURNING id"
+                "INSERT INTO public.menu_categories (name) "
+                "VALUES ('Mains') RETURNING id"
             )
 
             item_id = await connection.fetchval(
                 """
                 INSERT INTO public.menu_items
                     (category_id, name, price_cents, sort_order)
-                VALUES ($1, 'Bowl', 1399, 10) RETURNING id
+                VALUES ($1, 'Bowl', 1399, 10)
+                RETURNING id
                 """,
                 category_id,
             )
@@ -433,10 +503,12 @@ def test_modifiers_and_constraints(database_settings: Settings) -> None:
             )
 
             groups = {}
+
             group_sql = """
                 INSERT INTO public.modifier_groups
                     (menu_item_id, name, min_selections, max_selections, sort_order)
-                VALUES ($1, $2, $3, $4, $5) RETURNING id
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
             """
 
             for name, minimum, maximum, order in [
@@ -488,9 +560,15 @@ def test_modifiers_and_constraints(database_settings: Settings) -> None:
                 (0, 1),
             ]
 
-            assert [o.name for o in loaded[0].options] == ["Regular", "Large"]
+            assert [o.name for o in loaded[0].options] == [
+                "Regular",
+                "Large",
+            ]
             assert [o.price_delta_cents for o in loaded[0].options] == [0, 300]
-            assert [o.name for o in loaded[1].options] == ["Chicken", "Cheese"]
+            assert [o.name for o in loaded[1].options] == [
+                "Chicken",
+                "Cheese",
+            ]
             assert loaded[1].options[1].is_available is False
             assert loaded[2].options == []
             assert items[1].modifier_groups == []
@@ -550,5 +628,100 @@ def test_modifiers_and_constraints(database_settings: Settings) -> None:
                         True,
                         0,
                     )
+
+    asyncio.run(scenario())
+
+
+def test_menu_admin_and_selection(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            await connection.execute(
+                "INSERT INTO public.restaurant_settings (name) VALUES ('Admin Test')"
+            )
+
+            category_id = await connection.fetchval(
+                "INSERT INTO public.menu_categories (name) "
+                "VALUES ('Mains') RETURNING id"
+            )
+
+            item_id = await connection.fetchval(
+                """
+                INSERT INTO public.menu_items
+                    (category_id, name, price_cents)
+                VALUES ($1, 'Bowl', 1399)
+                RETURNING id
+                """,
+                category_id,
+            )
+
+            group_id = await connection.fetchval(
+                """
+                INSERT INTO public.modifier_groups
+                    (menu_item_id, name, min_selections, max_selections)
+                VALUES ($1, 'Size', 1, 1)
+                RETURNING id
+                """,
+                item_id,
+            )
+
+            option_id = await connection.fetchval(
+                """
+                INSERT INTO public.modifier_options
+                    (group_id, name, price_delta_cents)
+                VALUES ($1, 'Large', 300)
+                RETURNING id
+                """,
+                group_id,
+            )
+
+            admin = MenuAdminRepository(connection)
+            repository = MenuRepository(connection)
+            selection = SelectionRequest(
+                item_id=item_id,
+                option_ids=[option_id],
+            )
+
+            menu = await repository.get()
+            assert menu is not None
+            assert validate_selection(menu, selection).unit_price_cents == 1699
+
+            assert await admin.update_item(item_id, None, False)
+
+            menu = await repository.get()
+            assert menu is not None
+
+            with pytest.raises(SelectionError) as error:
+                validate_selection(menu, selection)
+
+            assert error.value.code == "item_unavailable"
+
+            assert await admin.update_item(item_id, 1499, True)
+            assert await admin.update_option(option_id, 350, False)
+
+            menu = await repository.get()
+            assert menu is not None
+
+            with pytest.raises(SelectionError) as error:
+                validate_selection(menu, selection)
+
+            assert error.value.code == "option_unavailable"
+
+            assert await admin.update_option(option_id, None, True)
+
+            menu = await repository.get()
+            assert menu is not None
+
+            result = validate_selection(menu, selection)
+            assert result.unit_price_cents == 1849
+            assert result.options[0].price_delta_cents == 350
+
+            assert await admin.update_option(option_id, 0, None)
+
+            menu = await repository.get()
+            assert menu is not None
+            assert validate_selection(menu, selection).unit_price_cents == 1499
+
+            assert await admin.update_item(uuid4(), 100, True) is False
+            assert await admin.update_option(uuid4(), 100, True) is False
 
     asyncio.run(scenario())
