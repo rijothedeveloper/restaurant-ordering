@@ -56,8 +56,11 @@ async def isolated_data(settings: Settings) -> AsyncIterator[asyncpg.Connection]
         async with app.state.db_pool.acquire(timeout=5) as connection:
             transaction = connection.transaction()
             await transaction.start()
-
             try:
+                await connection.execute("DELETE FROM public.cart_item_modifiers")
+                await connection.execute("DELETE FROM public.cart_items")
+                await connection.execute("DELETE FROM public.carts")
+                await connection.execute("DELETE FROM public.customers")
                 await connection.execute("DELETE FROM public.modifier_options")
                 await connection.execute("DELETE FROM public.modifier_groups")
                 await connection.execute("DELETE FROM public.menu_items")
@@ -723,5 +726,221 @@ def test_menu_admin_and_selection(database_settings: Settings) -> None:
 
             assert await admin.update_item(uuid4(), 100, True) is False
             assert await admin.update_option(uuid4(), 100, True) is False
+
+    asyncio.run(scenario())
+
+
+def test_customers_and_cart_identity(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            first_id = await connection.fetchval(
+                "INSERT INTO public.customers DEFAULT VALUES RETURNING id"
+            )
+            second_id = await connection.fetchval(
+                "INSERT INTO public.customers DEFAULT VALUES RETURNING id"
+            )
+            assert first_id != second_id
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.customers WHERE phone_e164 IS NULL"
+                )
+                == 2
+            )
+
+            await connection.execute(
+                "INSERT INTO public.customers (phone_e164) VALUES ($1)",
+                "+12025550123",
+            )
+            with pytest.raises(asyncpg.UniqueViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        "INSERT INTO public.customers (phone_e164) VALUES ($1)",
+                        "+12025550123",
+                    )
+
+            for invalid_phone in (
+                "",
+                "anonymous",
+                "12025550123",
+                "+0123456789",
+                "+1 202 555 0123",
+                "+1234567890123456",
+            ):
+                with pytest.raises(asyncpg.CheckViolationError):
+                    async with connection.transaction():
+                        await connection.execute(
+                            "INSERT INTO public.customers (phone_e164) VALUES ($1)",
+                            invalid_phone,
+                        )
+
+            first_cart = await connection.fetchrow(
+                "INSERT INTO public.carts (customer_id) VALUES ($1) RETURNING *",
+                first_id,
+            )
+            second_cart = await connection.fetchrow(
+                "INSERT INTO public.carts (customer_id) VALUES ($1) RETURNING *",
+                second_id,
+            )
+            assert first_cart["id"] != second_cart["id"]
+            assert first_cart["customer_id"] == first_id
+            assert second_cart["customer_id"] == second_id
+            assert first_cart["status"] == "BUILDING"
+            assert first_cart["created_at"].tzinfo is not None
+
+            # One customer can start another independent cart.
+            another_cart = await connection.fetchval(
+                "INSERT INTO public.carts (customer_id) VALUES ($1) RETURNING id",
+                first_id,
+            )
+            assert another_cart != first_cart["id"]
+
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        "INSERT INTO public.carts (customer_id) VALUES ($1)", uuid4()
+                    )
+
+            with pytest.raises(asyncpg.CheckViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        "UPDATE public.carts SET status = 'PAID' WHERE id = $1",
+                        first_cart["id"],
+                    )
+
+    asyncio.run(scenario())
+
+
+def test_cart_lines_modifiers_and_deletion(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            customer_id = await connection.fetchval(
+                "INSERT INTO public.customers DEFAULT VALUES RETURNING id"
+            )
+            cart_id = await connection.fetchval(
+                "INSERT INTO public.carts (customer_id) VALUES ($1) RETURNING id",
+                customer_id,
+            )
+            category_id = await connection.fetchval(
+                "INSERT INTO public.menu_categories (name) VALUES ('Mains') RETURNING id"
+            )
+            item_id = await connection.fetchval(
+                """
+                INSERT INTO public.menu_items (category_id, name, price_cents)
+                VALUES ($1, 'Bowl', 1399) RETURNING id
+                """,
+                category_id,
+            )
+            group_id = await connection.fetchval(
+                """
+                INSERT INTO public.modifier_groups
+                    (menu_item_id, name, min_selections, max_selections)
+                VALUES ($1, 'Size', 1, 1) RETURNING id
+                """,
+                item_id,
+            )
+            regular_id = await connection.fetchval(
+                """
+                INSERT INTO public.modifier_options (group_id, name, price_delta_cents)
+                VALUES ($1, 'Regular', 0) RETURNING id
+                """,
+                group_id,
+            )
+            large_id = await connection.fetchval(
+                """
+                INSERT INTO public.modifier_options (group_id, name, price_delta_cents)
+                VALUES ($1, 'Large', 300) RETURNING id
+                """,
+                group_id,
+            )
+
+            insert_line = """
+                INSERT INTO public.cart_items (cart_id, menu_item_id, quantity)
+                VALUES ($1, $2, $3) RETURNING id
+            """
+            regular_line = await connection.fetchval(insert_line, cart_id, item_id, 1)
+            large_line = await connection.fetchval(insert_line, cart_id, item_id, 2)
+            assert regular_line != large_line
+
+            insert_modifier = """
+                INSERT INTO public.cart_item_modifiers
+                    (cart_item_id, modifier_option_id) VALUES ($1, $2)
+            """
+            await connection.execute(insert_modifier, regular_line, regular_id)
+            await connection.execute(insert_modifier, large_line, large_id)
+
+            rows = await connection.fetch(
+                """
+                SELECT ci.id, ci.quantity, cim.modifier_option_id
+                FROM public.cart_items AS ci
+                JOIN public.cart_item_modifiers AS cim ON cim.cart_item_id = ci.id
+                WHERE ci.cart_id = $1
+                """,
+                cart_id,
+            )
+            assert {
+                (r["id"], r["quantity"], r["modifier_option_id"]) for r in rows
+            } == {
+                (regular_line, 1, regular_id),
+                (large_line, 2, large_id),
+            }
+
+            for quantity in (-1, 0, 21):
+                with pytest.raises(asyncpg.CheckViolationError):
+                    async with connection.transaction():
+                        await connection.fetchval(
+                            insert_line, cart_id, item_id, quantity
+                        )
+
+            for bad_cart, bad_item in ((uuid4(), item_id), (cart_id, uuid4())):
+                with pytest.raises(asyncpg.ForeignKeyViolationError):
+                    async with connection.transaction():
+                        await connection.fetchval(insert_line, bad_cart, bad_item, 1)
+
+            with pytest.raises(asyncpg.UniqueViolationError):
+                async with connection.transaction():
+                    await connection.execute(insert_modifier, regular_line, regular_id)
+
+            for bad_line, bad_option in (
+                (uuid4(), regular_id),
+                (regular_line, uuid4()),
+            ):
+                with pytest.raises(asyncpg.ForeignKeyViolationError):
+                    async with connection.transaction():
+                        await connection.execute(insert_modifier, bad_line, bad_option)
+
+            # Referenced catalog entries and customers cannot be removed.
+            for statement, record_id in (
+                ("DELETE FROM public.customers WHERE id = $1", customer_id),
+                ("DELETE FROM public.menu_items WHERE id = $1", item_id),
+                ("DELETE FROM public.modifier_options WHERE id = $1", regular_id),
+            ):
+                with pytest.raises(asyncpg.ForeignKeyViolationError):
+                    async with connection.transaction():
+                        await connection.execute(statement, record_id)
+
+            await connection.execute("DELETE FROM public.carts WHERE id = $1", cart_id)
+
+            assert (
+                await connection.fetchval("SELECT count(*) FROM public.cart_items") == 0
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.cart_item_modifiers"
+                )
+                == 0
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.customers WHERE id = $1", customer_id
+                )
+                == 1
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.modifier_options WHERE group_id = $1",
+                    group_id,
+                )
+                == 2
+            )
 
     asyncio.run(scenario())
