@@ -2,7 +2,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -12,10 +12,13 @@ from pydantic import SecretStr
 
 from app.config import Settings
 from app.main import create_app
+from app.repositories.cart import CartRepository
 from app.repositories.menu import MenuRepository
 from app.repositories.menu_admin import MenuAdminRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
+from app.schemas.cart import AddCartItemRequest
 from app.schemas.selection import SelectionRequest
+from app.services.cart import CartError, add_cart_item
 from app.services.menu_selection import SelectionError, validate_selection
 
 pytestmark = pytest.mark.integration
@@ -941,6 +944,266 @@ def test_cart_lines_modifiers_and_deletion(database_settings: Settings) -> None:
                     group_id,
                 )
                 == 2
+            )
+
+    asyncio.run(scenario())
+
+
+async def create_cart_test_data(
+    connection: asyncpg.Connection,
+) -> tuple[UUID, UUID, UUID, UUID, UUID]:
+    await connection.execute(
+        "INSERT INTO public.restaurant_settings (name) VALUES ('Cart Test')"
+    )
+    customer_id = await connection.fetchval(
+        "INSERT INTO public.customers DEFAULT VALUES RETURNING id"
+    )
+    cart_id = await connection.fetchval(
+        "INSERT INTO public.carts (customer_id) VALUES ($1) RETURNING id", customer_id
+    )
+    category_id = await connection.fetchval(
+        "INSERT INTO public.menu_categories (name) VALUES ('Mains') RETURNING id"
+    )
+    item_id = await connection.fetchval(
+        """
+        INSERT INTO public.menu_items (category_id, name, price_cents)
+        VALUES ($1, 'Bowl', 1399) RETURNING id
+        """,
+        category_id,
+    )
+    group_id = await connection.fetchval(
+        """
+        INSERT INTO public.modifier_groups
+            (menu_item_id, name, min_selections, max_selections)
+        VALUES ($1, 'Size', 1, 1) RETURNING id
+        """,
+        item_id,
+    )
+    regular_id = await connection.fetchval(
+        """
+        INSERT INTO public.modifier_options (group_id, name, price_delta_cents)
+        VALUES ($1, 'Regular', 0) RETURNING id
+        """,
+        group_id,
+    )
+    large_id = await connection.fetchval(
+        """
+        INSERT INTO public.modifier_options (group_id, name, price_delta_cents)
+        VALUES ($1, 'Large', 300) RETURNING id
+        """,
+        group_id,
+    )
+    return cart_id, customer_id, item_id, regular_id, large_id
+
+
+def test_add_cart_item_persists_validated_lines(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            (
+                cart_id,
+                customer_id,
+                item_id,
+                regular_id,
+                large_id,
+            ) = await create_cart_test_data(connection)
+            regular_request = AddCartItemRequest(
+                item_id=item_id, option_ids=[regular_id]
+            )
+            large_request = AddCartItemRequest(
+                item_id=item_id, option_ids=[large_id], quantity=2
+            )
+            regular = await add_cart_item(
+                connection,
+                cart_id=cart_id,
+                customer_id=customer_id,
+                item=regular_request,
+            )
+            large = await add_cart_item(
+                connection, cart_id=cart_id, customer_id=customer_id, item=large_request
+            )
+            repeated = await add_cart_item(
+                connection, cart_id=cart_id, customer_id=customer_id, item=large_request
+            )
+            assert len({regular.line_id, large.line_id, repeated.line_id}) == 3
+            assert regular.line_total_cents == 1399
+            assert large.unit_price_cents == 1699
+            assert large.line_total_cents == 3398
+
+            category_id = await connection.fetchval(
+                "SELECT category_id FROM public.menu_items WHERE id=$1", item_id
+            )
+            plain_id = await connection.fetchval(
+                """
+                INSERT INTO public.menu_items (category_id, name, price_cents)
+                VALUES ($1, 'Plain bowl', 999) RETURNING id
+                """,
+                category_id,
+            )
+            plain = await add_cart_item(
+                connection,
+                cart_id=cart_id,
+                customer_id=customer_id,
+                item=AddCartItemRequest(item_id=plain_id),
+            )
+            assert plain.options == []
+            assert plain.line_total_cents == 999
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.cart_item_modifiers WHERE cart_item_id=$1",
+                    plain.line_id,
+                )
+                == 0
+            )
+
+            for result, option_id in ((regular, regular_id), (large, large_id)):
+                row = await connection.fetchrow(
+                    "SELECT cart_id, menu_item_id, quantity FROM public.cart_items WHERE id=$1",
+                    result.line_id,
+                )
+                assert row["cart_id"] == cart_id
+                assert row["menu_item_id"] == item_id
+                assert row["quantity"] == result.quantity
+                options = await connection.fetch(
+                    "SELECT modifier_option_id FROM public.cart_item_modifiers WHERE cart_item_id=$1",
+                    result.line_id,
+                )
+                assert [r["modifier_option_id"] for r in options] == [option_id]
+
+            for chosen, expected in (
+                ([], "too_few_options"),
+                ([large_id, large_id], "duplicate_option"),
+                ([uuid4()], "invalid_option"),
+            ):
+                with pytest.raises(SelectionError) as error:
+                    await add_cart_item(
+                        connection,
+                        cart_id=cart_id,
+                        customer_id=customer_id,
+                        item=AddCartItemRequest(item_id=item_id, option_ids=chosen),
+                    )
+                assert error.value.code == expected
+
+            for wrong_cart, wrong_customer in (
+                (uuid4(), customer_id),
+                (cart_id, uuid4()),
+            ):
+                with pytest.raises(CartError) as error:
+                    await add_cart_item(
+                        connection,
+                        cart_id=wrong_cart,
+                        customer_id=wrong_customer,
+                        item=large_request,
+                    )
+                assert error.value.code == "cart_not_found"
+
+            await connection.execute(
+                "UPDATE public.carts SET status='CHECKED_OUT' WHERE id=$1", cart_id
+            )
+            with pytest.raises(CartError) as error:
+                await add_cart_item(
+                    connection,
+                    cart_id=cart_id,
+                    customer_id=customer_id,
+                    item=large_request,
+                )
+            assert error.value.code == "cart_not_editable"
+            await connection.execute(
+                "UPDATE public.carts SET status='BUILDING' WHERE id=$1", cart_id
+            )
+            await connection.execute(
+                "UPDATE public.modifier_options SET is_available=false WHERE id=$1",
+                large_id,
+            )
+            with pytest.raises(SelectionError) as error:
+                await add_cart_item(
+                    connection,
+                    cart_id=cart_id,
+                    customer_id=customer_id,
+                    item=large_request,
+                )
+            assert error.value.code == "option_unavailable"
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.cart_items WHERE cart_id=$1", cart_id
+                )
+                == 4
+            )
+
+            await connection.execute(
+                "UPDATE public.menu_items SET price_cents=1499 WHERE id=$1", item_id
+            )
+            await connection.execute(
+                "UPDATE public.modifier_options SET price_delta_cents=350, is_available=true WHERE id=$1",
+                large_id,
+            )
+            repriced = await add_cart_item(
+                connection, cart_id=cart_id, customer_id=customer_id, item=large_request
+            )
+            assert repriced.unit_price_cents == 1849
+            assert repriced.line_total_cents == 3698
+
+    asyncio.run(scenario())
+
+
+def test_add_cart_item_rolls_back_all_writes(
+    database_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            cart_id, customer_id, item_id, _, large_id = await create_cart_test_data(
+                connection
+            )
+            request = AddCartItemRequest(
+                item_id=item_id, option_ids=[large_id], quantity=2
+            )
+            original = CartRepository.insert_line
+
+            async def fail_after_insert(self, cart_id, item_id, quantity, option_ids):
+                line_id = await original(self, cart_id, item_id, quantity, option_ids)
+                # Force a real constraint failure after the line and option were written.
+                await self.connection.execute(
+                    """
+                    INSERT INTO public.cart_item_modifiers
+                        (cart_item_id, modifier_option_id) VALUES ($1, $2)
+                    """,
+                    line_id,
+                    option_ids[0],
+                )
+                return line_id
+
+            with monkeypatch.context() as patch:
+                patch.setattr(CartRepository, "insert_line", fail_after_insert)
+                with pytest.raises(asyncpg.UniqueViolationError):
+                    await add_cart_item(
+                        connection,
+                        cart_id=cart_id,
+                        customer_id=customer_id,
+                        item=request,
+                    )
+
+            assert (
+                await connection.fetchval("SELECT count(*) FROM public.cart_items") == 0
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.cart_item_modifiers"
+                )
+                == 0
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.carts WHERE id=$1", cart_id
+                )
+                == 1
+            )
+
+            # The connection is usable after rollback, and a later add can succeed.
+            result = await add_cart_item(
+                connection, cart_id=cart_id, customer_id=customer_id, item=request
+            )
+            assert result.line_total_cents == 3398
+            assert (
+                await connection.fetchval("SELECT count(*) FROM public.cart_items") == 1
             )
 
     asyncio.run(scenario())
