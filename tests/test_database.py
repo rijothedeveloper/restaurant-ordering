@@ -16,9 +16,15 @@ from app.repositories.cart import CartRepository
 from app.repositories.menu import MenuRepository
 from app.repositories.menu_admin import MenuAdminRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
-from app.schemas.cart import AddCartItemRequest
+from app.schemas.cart import AddCartItemRequest, UpdateCartItemRequest
 from app.schemas.selection import SelectionRequest
-from app.services.cart import CartError, add_cart_item
+from app.services.cart import (
+    CartError,
+    add_cart_item,
+    get_cart,
+    remove_cart_item,
+    update_cart_item,
+)
 from app.services.menu_selection import SelectionError, validate_selection
 
 pytestmark = pytest.mark.integration
@@ -1205,5 +1211,328 @@ def test_add_cart_item_rolls_back_all_writes(
             assert (
                 await connection.fetchval("SELECT count(*) FROM public.cart_items") == 1
             )
+
+    asyncio.run(scenario())
+
+
+def test_cart_read_update_and_remove(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            (
+                cart_id,
+                customer_id,
+                item_id,
+                regular_id,
+                large_id,
+            ) = await create_cart_test_data(connection)
+
+            context = {"cart_id": cart_id, "customer_id": customer_id}
+
+            empty = await get_cart(connection, **context)
+            assert empty.items == []
+            assert empty.subtotal_cents == 0
+
+            regular = await add_cart_item(
+                connection,
+                **context,
+                item=AddCartItemRequest(item_id=item_id, option_ids=[regular_id]),
+            )
+            large = await add_cart_item(
+                connection,
+                **context,
+                item=AddCartItemRequest(
+                    item_id=item_id, option_ids=[large_id], quantity=2
+                ),
+            )
+
+            cart = await get_cart(connection, **context)
+            assert cart.subtotal_cents == 4797
+
+            # Both timestamps use the outer transaction's now(); UUID breaks the tie.
+            assert [line.line_id for line in cart.items] == sorted(
+                [regular.line_id, large.line_id], key=str
+            )
+            assert (
+                await get_cart(connection, **context)
+            ).model_dump() == cart.model_dump()
+
+            cart = await update_cart_item(
+                connection,
+                **context,
+                line_id=regular.line_id,
+                item=UpdateCartItemRequest(quantity=3, option_ids=[regular_id]),
+            )
+            assert cart.subtotal_cents == 7595
+
+            cart = await update_cart_item(
+                connection,
+                **context,
+                line_id=regular.line_id,
+                item=UpdateCartItemRequest(quantity=3, option_ids=[large_id]),
+            )
+            assert cart.subtotal_cents == 8495
+            assert len(cart.items) == 2
+
+            changed = next(
+                line for line in cart.items if line.line_id == regular.line_id
+            )
+            assert changed.quantity == 3
+            assert changed.option_ids == [large_id]
+
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.cart_item_modifiers WHERE cart_item_id=$1",
+                    regular.line_id,
+                )
+                == 1
+            )
+
+            with pytest.raises(SelectionError) as error:
+                await update_cart_item(
+                    connection,
+                    **context,
+                    line_id=regular.line_id,
+                    item=UpdateCartItemRequest(quantity=1, option_ids=[]),
+                )
+            assert error.value.code == "too_few_options"
+            assert (await get_cart(connection, **context)).subtotal_cents == 8495
+
+            await connection.execute(
+                "UPDATE public.menu_items SET price_cents=1499 WHERE id=$1", item_id
+            )
+            await connection.execute(
+                "UPDATE public.modifier_options SET price_delta_cents=350 WHERE id=$1",
+                large_id,
+            )
+
+            assert (await get_cart(connection, **context)).subtotal_cents == 9245
+
+            await connection.execute(
+                "UPDATE public.modifier_options SET is_available=false WHERE id=$1",
+                large_id,
+            )
+
+            invalid = await get_cart(connection, **context)
+            assert invalid.subtotal_cents is None
+            assert len(invalid.items) == 2
+            assert all(
+                line.issue.code == "option_unavailable" for line in invalid.items
+            )
+            assert all(line.line_total_cents is None for line in invalid.items)
+            assert all(line.item_name == "Bowl" for line in invalid.items)
+
+            remaining = await remove_cart_item(
+                connection, **context, line_id=regular.line_id
+            )
+            assert len(remaining.items) == 1
+            assert remaining.subtotal_cents is None
+
+            empty = await remove_cart_item(connection, **context, line_id=large.line_id)
+            assert empty.items == []
+            assert empty.subtotal_cents == 0
+
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.cart_item_modifiers"
+                )
+                == 0
+            )
+
+            # Explicit [] removes all choices when that group's minimum permits it.
+            await connection.execute(
+                "UPDATE public.modifier_groups SET min_selections=0 WHERE menu_item_id=$1",
+                item_id,
+            )
+
+            added = await add_cart_item(
+                connection,
+                **context,
+                item=AddCartItemRequest(item_id=item_id, option_ids=[regular_id]),
+            )
+
+            cleared = await update_cart_item(
+                connection,
+                **context,
+                line_id=added.line_id,
+                item=UpdateCartItemRequest(quantity=2, option_ids=[]),
+            )
+
+            assert cleared.subtotal_cents == 2998
+            assert cleared.items[0].option_ids == []
+            assert cleared.items[0].options == []
+            assert cleared.items[0].issue is None
+
+    asyncio.run(scenario())
+
+
+def test_cart_operations_enforce_context(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            cart_id, customer_id, item_id, regular_id, _ = await create_cart_test_data(
+                connection
+            )
+            context = {"cart_id": cart_id, "customer_id": customer_id}
+
+            added = await add_cart_item(
+                connection,
+                **context,
+                item=AddCartItemRequest(item_id=item_id, option_ids=[regular_id]),
+            )
+
+            other_customer = await connection.fetchval(
+                "INSERT INTO public.customers DEFAULT VALUES RETURNING id"
+            )
+            other_cart = await connection.fetchval(
+                "INSERT INTO public.carts (customer_id) VALUES ($1) RETURNING id",
+                other_customer,
+            )
+            other_line = await add_cart_item(
+                connection,
+                cart_id=other_cart,
+                customer_id=other_customer,
+                item=AddCartItemRequest(
+                    item_id=item_id, option_ids=[regular_id], quantity=2
+                ),
+            )
+
+            edit = UpdateCartItemRequest(quantity=3, option_ids=[regular_id])
+
+            for operation in ("read", "update", "remove"):
+                with pytest.raises(CartError) as error:
+                    wrong = {"cart_id": cart_id, "customer_id": other_customer}
+
+                    if operation == "read":
+                        await get_cart(connection, **wrong)
+                    elif operation == "update":
+                        await update_cart_item(
+                            connection, **wrong, line_id=added.line_id, item=edit
+                        )
+                    else:
+                        await remove_cart_item(
+                            connection, **wrong, line_id=added.line_id
+                        )
+
+                assert error.value.code == "cart_not_found"
+
+            for line_id in (other_line.line_id, uuid4()):
+                for operation in ("update", "remove"):
+                    with pytest.raises(CartError) as error:
+                        if operation == "update":
+                            await update_cart_item(
+                                connection, **context, line_id=line_id, item=edit
+                            )
+                        else:
+                            await remove_cart_item(
+                                connection, **context, line_id=line_id
+                            )
+
+                    assert error.value.code == "line_not_found"
+
+            assert (await get_cart(connection, **context)).subtotal_cents == 1399
+
+            other = await get_cart(
+                connection, cart_id=other_cart, customer_id=other_customer
+            )
+            assert other.subtotal_cents == 2798
+
+            await connection.execute(
+                "UPDATE public.carts SET status='CHECKED_OUT' WHERE id=$1", cart_id
+            )
+            assert (await get_cart(connection, **context)).status == "CHECKED_OUT"
+
+            for operation in ("update", "remove"):
+                with pytest.raises(CartError) as error:
+                    if operation == "update":
+                        await update_cart_item(
+                            connection, **context, line_id=added.line_id, item=edit
+                        )
+                    else:
+                        await remove_cart_item(
+                            connection, **context, line_id=added.line_id
+                        )
+
+                assert error.value.code == "cart_not_editable"
+
+    asyncio.run(scenario())
+
+
+def test_cart_edit_rollbacks_preserve_original_line(
+    database_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            (
+                cart_id,
+                customer_id,
+                item_id,
+                regular_id,
+                large_id,
+            ) = await create_cart_test_data(connection)
+
+            context = {"cart_id": cart_id, "customer_id": customer_id}
+
+            added = await add_cart_item(
+                connection,
+                **context,
+                item=AddCartItemRequest(
+                    item_id=item_id, option_ids=[regular_id], quantity=2
+                ),
+            )
+
+            before = await get_cart(connection, **context)
+            original_replace = CartRepository.replace_line
+            original_delete = CartRepository.delete_line
+
+            async def fail_after_replace(self, cart_id, line_id, quantity, option_ids):
+                updated = await original_replace(
+                    self, cart_id, line_id, quantity, option_ids
+                )
+                await self.connection.execute(
+                    "INSERT INTO public.cart_item_modifiers (cart_item_id,modifier_option_id) VALUES ($1,$2)",
+                    line_id,
+                    option_ids[0],
+                )
+                return updated
+
+            with monkeypatch.context() as patch:
+                patch.setattr(CartRepository, "replace_line", fail_after_replace)
+
+                with pytest.raises(asyncpg.UniqueViolationError):
+                    await update_cart_item(
+                        connection,
+                        **context,
+                        line_id=added.line_id,
+                        item=UpdateCartItemRequest(quantity=4, option_ids=[large_id]),
+                    )
+
+            assert (
+                await get_cart(connection, **context)
+            ).model_dump() == before.model_dump()
+
+            async def fail_after_delete(self, cart_id, line_id):
+                await original_delete(self, cart_id, line_id)
+                raise OSError("simulated failure after cascading deletion")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(CartRepository, "delete_line", fail_after_delete)
+
+                with pytest.raises(OSError):
+                    await remove_cart_item(connection, **context, line_id=added.line_id)
+
+            assert (
+                await get_cart(connection, **context)
+            ).model_dump() == before.model_dump()
+
+            assert (
+                await connection.fetchval(
+                    "SELECT modifier_option_id FROM public.cart_item_modifiers WHERE cart_item_id=$1",
+                    added.line_id,
+                )
+                == regular_id
+            )
+
+            empty = await remove_cart_item(connection, **context, line_id=added.line_id)
+            assert empty.items == []
+            assert empty.subtotal_cents == 0
 
     asyncio.run(scenario())

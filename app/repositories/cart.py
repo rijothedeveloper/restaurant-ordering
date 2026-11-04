@@ -2,6 +2,8 @@ from uuid import UUID
 
 import asyncpg
 
+from app.schemas.cart import StoredCartLine
+
 
 class CartRepository:
     def __init__(self, connection: asyncpg.Connection) -> None:
@@ -38,6 +40,10 @@ class CartRepository:
             item_id,
             quantity,
         )
+        await self._insert_modifiers(line_id, option_ids)
+        return line_id
+
+    async def _insert_modifiers(self, line_id: UUID, option_ids: list[UUID]) -> None:
         if option_ids:
             await self.connection.executemany(
                 """
@@ -47,4 +53,70 @@ class CartRepository:
                 """,
                 [(line_id, option_id) for option_id in option_ids],
             )
-        return line_id
+
+    async def list_lines(self, cart_id: UUID) -> list[StoredCartLine]:
+        rows = await self.connection.fetch(
+            """
+            SELECT ci.id AS line_id, ci.menu_item_id AS item_id, ci.quantity,
+                COALESCE(
+                    array_agg(cim.modifier_option_id ORDER BY cim.modifier_option_id)
+                        FILTER (WHERE cim.modifier_option_id IS NOT NULL),
+                    ARRAY[]::uuid[]
+                ) AS option_ids
+            FROM public.cart_items AS ci
+            LEFT JOIN public.cart_item_modifiers AS cim ON cim.cart_item_id = ci.id
+            WHERE ci.cart_id = $1
+            GROUP BY ci.id
+            ORDER BY ci.created_at, ci.id
+            """,
+            cart_id,
+        )
+        return [StoredCartLine.model_validate(dict(row)) for row in rows]
+
+    async def get_item_id(self, cart_id: UUID, line_id: UUID) -> UUID | None:
+        return await self.connection.fetchval(
+            """
+            SELECT menu_item_id FROM public.cart_items
+            WHERE cart_id = $1 AND id = $2
+            """,
+            cart_id,
+            line_id,
+        )
+
+    async def replace_line(
+        self,
+        cart_id: UUID,
+        line_id: UUID,
+        quantity: int,
+        option_ids: list[UUID],
+    ) -> bool:
+        updated = await self.connection.fetchval(
+            """
+            UPDATE public.cart_items SET quantity = $3
+            WHERE cart_id = $1 AND id = $2
+            RETURNING id
+            """,
+            cart_id,
+            line_id,
+            quantity,
+        )
+        if updated is None:
+            return False
+
+        await self.connection.execute(
+            "DELETE FROM public.cart_item_modifiers WHERE cart_item_id = $1", line_id
+        )
+        await self._insert_modifiers(line_id, option_ids)
+        return True
+
+    async def delete_line(self, cart_id: UUID, line_id: UUID) -> bool:
+        deleted = await self.connection.fetchval(
+            """
+            DELETE FROM public.cart_items
+            WHERE cart_id = $1 AND id = $2
+            RETURNING id
+            """,
+            cart_id,
+            line_id,
+        )
+        return deleted is not None
