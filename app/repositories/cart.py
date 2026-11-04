@@ -120,3 +120,19 @@ class CartRepository:
             line_id,
         )
         return deleted is not None
+
+    async def get_version(self, cart_id: UUID) -> int:
+        return await self.connection.fetchval(
+            "SELECT version FROM public.carts WHERE id = $1", cart_id
+        )
+
+    async def advance_version(self, cart_id: UUID, expected_version: int) -> int | None:
+        return await self.connection.fetchval(
+            """
+            UPDATE public.carts SET version = version + 1
+            WHERE id = $1 AND version = $2
+            RETURNING version
+            """,
+            cart_id,
+            expected_version,
+        )

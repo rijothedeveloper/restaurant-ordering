@@ -57,7 +57,9 @@ def cart_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     connection = MagicMock(spec=asyncpg.Connection)
     transaction = connection.transaction.return_value
     transaction.__aexit__.return_value = False
+
     item_id, option_id = uuid4(), uuid4()
+
     menu = MenuResponse(
         restaurant_name="Test Kitchen",
         ordering_enabled=False,
@@ -93,12 +95,19 @@ def cart_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             )
         ],
     )
+
     status = AsyncMock(return_value="BUILDING")
+    version = AsyncMock(return_value=0)
+    advance = AsyncMock(return_value=1)
     get_menu = AsyncMock(return_value=menu)
     insert = AsyncMock(return_value=uuid4())
+
     monkeypatch.setattr(CartRepository, "get_status_for_update", status)
+    monkeypatch.setattr(CartRepository, "get_version", version)
+    monkeypatch.setattr(CartRepository, "advance_version", advance)
     monkeypatch.setattr(MenuRepository, "get", get_menu)
     monkeypatch.setattr(CartRepository, "insert_line", insert)
+
     return SimpleNamespace(
         connection=connection,
         transaction=transaction,
@@ -107,6 +116,8 @@ def cart_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         item_id=item_id,
         option_id=option_id,
         status=status,
+        version=version,
+        advance=advance,
         get_menu=get_menu,
         insert=insert,
     )
@@ -118,6 +129,7 @@ def run_add(deps: SimpleNamespace, item: AddCartItemRequest):
             deps.connection,
             cart_id=deps.cart_id,
             customer_id=deps.customer_id,
+            expected_version=0,
             item=item,
         )
     )
@@ -232,7 +244,11 @@ def test_cart_subtotal_uses_each_line_once(
     ]
 
     response = build_cart_response(
-        d.cart_id, "BUILDING", lines, d.get_menu.return_value
+        d.cart_id,
+        "BUILDING",
+        lines,
+        d.get_menu.return_value,
+        version=0,
     )
 
     assert response.subtotal_cents == expected
@@ -269,7 +285,13 @@ def test_cart_read_preserves_invalid_lines(
     else:
         line.item_id = uuid4()
 
-    response = build_cart_response(d.cart_id, "BUILDING", [line], menu)
+    response = build_cart_response(
+        d.cart_id,
+        "BUILDING",
+        [line],
+        menu,
+        version=0,
+    )
 
     assert response.subtotal_cents is None
     assert response.items[0].line_id == line.line_id
@@ -292,8 +314,13 @@ def test_cart_zero_price_is_a_valid_subtotal(
         line_id=uuid4(), item_id=d.item_id, quantity=2, option_ids=[d.option_id]
     )
 
-    response = build_cart_response(d.cart_id, "BUILDING", [line], menu)
-
+    response = build_cart_response(
+        d.cart_id,
+        "BUILDING",
+        [line],
+        menu,
+        version=0,
+    )
     assert response.subtotal_cents == 0
     assert response.items[0].issue is None
 
@@ -317,21 +344,52 @@ def cart_edit_dependencies(
     return d
 
 
-def run_cart_operation(d: SimpleNamespace, operation: str):
-    context = {"cart_id": d.cart_id, "customer_id": d.customer_id}
+def run_cart_operation(
+    d: SimpleNamespace,
+    operation: str,
+    expected_version: int = 0,
+):
+    context = {
+        "cart_id": d.cart_id,
+        "customer_id": d.customer_id,
+    }
 
     if operation == "read":
         return asyncio.run(get_cart(d.connection, **context))
 
+    if operation == "add":
+        return asyncio.run(
+            add_cart_item(
+                d.connection,
+                **context,
+                expected_version=expected_version,
+                item=AddCartItemRequest(
+                    item_id=d.item_id,
+                    option_ids=[d.option_id],
+                ),
+            )
+        )
+
     if operation == "remove":
-        return asyncio.run(remove_cart_item(d.connection, **context, line_id=d.line_id))
+        return asyncio.run(
+            remove_cart_item(
+                d.connection,
+                **context,
+                line_id=d.line_id,
+                expected_version=expected_version,
+            )
+        )
 
     return asyncio.run(
         update_cart_item(
             d.connection,
             **context,
             line_id=d.line_id,
-            item=UpdateCartItemRequest(quantity=3, option_ids=[d.option_id]),
+            expected_version=expected_version,
+            item=UpdateCartItemRequest(
+                quantity=3,
+                option_ids=[d.option_id],
+            ),
         )
     )
 
@@ -407,8 +465,12 @@ def test_cart_update_rejects_invalid_selection_before_write(
                 d.connection,
                 cart_id=d.cart_id,
                 customer_id=d.customer_id,
+                expected_version=0,
                 line_id=d.line_id,
-                item=UpdateCartItemRequest(quantity=3, option_ids=[]),
+                item=UpdateCartItemRequest(
+                    quantity=3,
+                    option_ids=[],
+                ),
             )
         )
 
@@ -443,3 +505,68 @@ def test_cart_remove_allows_unavailable_selection(
     assert response.items == []
     assert response.subtotal_cents == 0
     d.delete.assert_awaited_once_with(d.cart_id, d.line_id)
+
+
+@pytest.mark.parametrize("operation", ["add", "update", "remove"])
+def test_cart_mutations_reject_stale_versions(
+    cart_edit_dependencies: SimpleNamespace,
+    operation: str,
+) -> None:
+    d = cart_edit_dependencies
+    d.advance.return_value = None
+
+    with pytest.raises(CartError) as error:
+        run_cart_operation(d, operation)
+
+    assert error.value.code == "cart_version_conflict"
+
+    d.advance.assert_awaited_once_with(d.cart_id, 0)
+    d.get_menu.assert_not_awaited()
+    d.insert.assert_not_awaited()
+    d.replace.assert_not_awaited()
+    d.delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("operation", ["add", "update", "remove"])
+@pytest.mark.parametrize("version", [-1, True, "0", 0.0, None, 2**63])
+def test_cart_mutations_reject_invalid_versions(
+    cart_edit_dependencies: SimpleNamespace,
+    operation: str,
+    version: object,
+) -> None:
+    d = cart_edit_dependencies
+
+    with pytest.raises(CartError) as error:
+        run_cart_operation(d, operation, version)
+
+    assert error.value.code == "invalid_cart_version"
+
+    d.advance.assert_not_awaited()
+    d.insert.assert_not_awaited()
+    d.replace.assert_not_awaited()
+    d.delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("operation", ["add", "update", "remove"])
+def test_cart_mutations_return_new_version(
+    cart_edit_dependencies: SimpleNamespace,
+    operation: str,
+) -> None:
+    d = cart_edit_dependencies
+
+    response = run_cart_operation(d, operation)
+
+    assert response.version == 1
+    d.advance.assert_awaited_once_with(d.cart_id, 0)
+
+
+def test_read_returns_version_without_advancing_it(
+    cart_edit_dependencies: SimpleNamespace,
+) -> None:
+    d = cart_edit_dependencies
+    d.version.return_value = 7
+
+    response = run_cart_operation(d, "read")
+
+    assert response.version == 7
+    d.advance.assert_not_awaited()

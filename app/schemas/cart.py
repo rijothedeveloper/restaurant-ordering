@@ -12,6 +12,7 @@ class AddCartItemRequest(SelectionRequest):
 
 
 class AddedCartItem(ValidatedSelection):
+    version: int = Field(ge=0)
     line_id: UUID
     quantity: int = Field(ge=1, le=20)
     line_total_cents: int = Field(ge=0)
@@ -42,6 +43,7 @@ class CartLine(StoredCartLine):
 
 
 class CartResponse(BaseModel):
+    version: int = Field(ge=0)
     cart_id: UUID
     status: str
     currency: Literal["USD"] = "USD"
