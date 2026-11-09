@@ -287,3 +287,37 @@ async def confirm_quote(
             )
 
     return result
+
+
+async def get_confirmed_quote(
+    connection: asyncpg.Connection,
+    *,
+    quote_id: UUID,
+    cart_id: UUID,
+    customer_id: UUID,
+) -> tuple[QuoteResponse, datetime]:
+    # Placement calls this inside its outer transaction,
+    # retaining both the cart and quote locks.
+    async with connection.transaction():
+        row, _ = await _require_pending_quote(
+            connection,
+            quote_id,
+            cart_id,
+            customer_id,
+        )
+
+        if row["confirmed_at"] is None:
+            raise QuoteError(
+                "quote_not_confirmed",
+                "Confirm this quote first.",
+            )
+
+        quote = await get_quote(
+            connection,
+            quote_id=quote_id,
+            cart_id=cart_id,
+            customer_id=customer_id,
+        )
+        result = quote, row["confirmed_at"]
+
+    return result

@@ -147,3 +147,15 @@ class CartRepository:
             )
 
         return version
+
+    async def mark_checked_out(self, cart_id: UUID, expected_version: int) -> bool:
+        updated = await self.connection.fetchval(
+            """
+            UPDATE public.carts SET status = 'CHECKED_OUT'
+            WHERE id = $1 AND version = $2 AND status = 'BUILDING'
+            RETURNING id
+            """,
+            cart_id,
+            expected_version,
+        )
+        return updated is not None

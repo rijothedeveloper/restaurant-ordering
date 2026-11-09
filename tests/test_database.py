@@ -17,6 +17,7 @@ from app.main import create_app
 from app.repositories.cart import CartRepository
 from app.repositories.menu import MenuRepository
 from app.repositories.menu_admin import MenuAdminRepository
+from app.repositories.order import OrderRepository
 from app.repositories.quote import QuoteRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
 from app.schemas.cart import AddCartItemRequest, UpdateCartItemRequest
@@ -30,6 +31,7 @@ from app.services.cart import (
     update_cart_item,
 )
 from app.services.menu_selection import SelectionError, validate_selection
+from app.services.order import OrderError, get_order, place_order
 from app.services.quote import (
     QuoteError,
     build_quote,
@@ -81,6 +83,7 @@ async def isolated_data(settings: Settings) -> AsyncIterator[asyncpg.Connection]
             await transaction.start()
 
             try:
+                await connection.execute("DELETE FROM public.orders")
                 await connection.execute("DELETE FROM public.cart_item_modifiers")
                 await connection.execute("DELETE FROM public.cart_items")
                 await connection.execute("DELETE FROM public.carts")
@@ -2035,6 +2038,10 @@ async def committed_cart_data(settings: Settings) -> AsyncIterator[SimpleNamespa
                             f"DELETE FROM public.{table} WHERE {column}=$1",
                             value,
                         )
+                        await connection.execute(
+                            "DELETE FROM public.orders WHERE cart_id=$1",
+                            d.cart_id,
+                        )
 
                     if created_settings:
                         await connection.execute(
@@ -2895,5 +2902,417 @@ def test_confirmation_waits_for_cart_edit(database_settings: Settings):
                             if not pending.done():
                                 pending.cancel()
                             await asyncio.gather(pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+async def confirm_test_quote(connection, context, quote):
+    target = {**context, "quote_id": quote.quote_id}
+    receipt = await complete_quote_readback(connection, **target)
+
+    confirmation = await confirm_quote(
+        connection,
+        **target,
+        readback_token=receipt.readback_token,
+        answer="yes",
+    )
+    assert confirmation is not None
+    return confirmation
+
+
+def test_order_copies_confirmed_snapshot(database_settings: Settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, item_id, large_id, _ = await prepare_pending_quote(connection)
+
+            # Include two separate lines, one without modifiers.
+            await connection.execute(
+                """
+                UPDATE public.modifier_groups
+                SET min_selections=0 WHERE menu_item_id=$1
+                """,
+                item_id,
+            )
+            await add_cart_item(
+                connection,
+                **context,
+                expected_version=1,
+                item=AddCartItemRequest(
+                    item_id=item_id,
+                    quantity=2,
+                    option_ids=[],
+                ),
+            )
+
+            quote = await create_quote(connection, **context, expected_version=2)
+            confirmation = await confirm_test_quote(connection, context, quote)
+            order = await place_order(connection, **context, quote_id=quote.quote_id)
+
+            assert order.order_number > 0
+            assert order.cart_id == quote.cart_id
+            assert order.quote_id == quote.quote_id
+            assert order.cart_version == 2
+            assert order.status == "PLACED"
+            assert order.payment_status == "UNPAID"
+            assert order.items == quote.items
+            assert (
+                order.subtotal_cents,
+                order.tax_cents,
+                order.total_cents,
+            ) == (4497, 450, 4947)
+            assert order.tax_rate_bps == quote.tax_rate_bps == 1000
+            assert order.pickup_at == quote.pickup_at
+            assert order.confirmed_at == confirmation.confirmed_at
+            assert order.confirmed_at <= order.placed_at < quote.expires_at
+
+            cart = await get_cart(connection, **context)
+            assert cart.status == "CHECKED_OUT"
+            assert cart.version == 2
+
+            state = await quote_state(connection, quote.quote_id)
+            assert state["is_pending"] is False
+
+            event = await connection.fetchrow(
+                """
+                SELECT event_type,
+                       data->>'payment_status' AS payment,
+                       occurred_at
+                FROM public.order_events
+                WHERE order_id=$1
+                """,
+                order.order_id,
+            )
+            assert event["event_type"] == "ORDER_PLACED"
+            assert event["payment"] == "UNPAID"
+            assert event["occurred_at"] == order.placed_at
+
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.order_events WHERE order_id=$1",
+                    order.order_id,
+                )
+                == 1
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.order_items WHERE order_id=$1",
+                    order.order_id,
+                )
+                == 2
+            )
+
+            with pytest.raises(OrderError) as error:
+                await get_order(
+                    connection,
+                    order_id=order.order_id,
+                    customer_id=uuid4(),
+                )
+            assert error.value.code == "order_not_found"
+
+            with pytest.raises(CartError) as error:
+                await remove_cart_item(
+                    connection,
+                    **context,
+                    expected_version=2,
+                    line_id=quote.items[0].line_id,
+                )
+            assert error.value.code == "cart_not_editable"
+
+            # Lesson 4 will change this retry into a saved-order response.
+            with pytest.raises(QuoteError) as error:
+                await place_order(connection, **context, quote_id=quote.quote_id)
+            assert error.value.code == "cart_not_quotable"
+
+            # The database also rejects a second order for this cart.
+            with pytest.raises(asyncpg.UniqueViolationError):
+                async with connection.transaction():
+                    await OrderRepository(connection).insert(
+                        quote,
+                        context["customer_id"],
+                        confirmation.confirmed_at,
+                        order.placed_at,
+                    )
+
+            await connection.execute(
+                """
+                UPDATE public.menu_items
+                SET name='New bowl', price_cents=1999 WHERE id=$1
+                """,
+                item_id,
+            )
+            await connection.execute(
+                """
+                UPDATE public.modifier_options
+                SET name='XL', price_delta_cents=500, is_available=false
+                WHERE id=$1
+                """,
+                large_id,
+            )
+            await connection.execute(
+                """
+                UPDATE public.restaurant_settings
+                SET tax_rate_bps=500 WHERE id=1
+                """
+            )
+
+            # Test-only removal proves the order has its own snapshots.
+            await connection.execute(
+                "DELETE FROM public.cart_items WHERE cart_id=$1",
+                context["cart_id"],
+            )
+
+            loaded = await get_order(
+                connection,
+                order_id=order.order_id,
+                customer_id=context["customer_id"],
+            )
+            assert loaded == order
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "case,code",
+    [
+        ("unconfirmed", "quote_not_confirmed"),
+        ("reread", "quote_not_confirmed"),
+        ("declined", "quote_not_pending"),
+        ("replaced", "quote_not_pending"),
+        ("edited", "quote_stale"),
+        ("expired", "quote_expired"),
+        ("wrong_customer", "cart_not_found"),
+        ("wrong_cart", "cart_not_found"),
+        ("missing_quote", "quote_not_found"),
+        ("different_cart", "quote_not_found"),
+    ],
+)
+def test_order_requires_current_confirmation(database_settings: Settings, case, code):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, _, large_id, quote = await prepare_pending_quote(connection)
+            target = {**context, "quote_id": quote.quote_id}
+
+            if case != "unconfirmed":
+                await confirm_test_quote(connection, context, quote)
+
+            if case == "reread":
+                await complete_quote_readback(connection, **target)
+
+            elif case == "declined":
+                state = await quote_state(connection, quote.quote_id)
+                await confirm_quote(
+                    connection,
+                    **target,
+                    readback_token=state["readback_token"],
+                    answer="no",
+                )
+
+            elif case == "replaced":
+                await create_quote(connection, **context, expected_version=1)
+
+            elif case == "edited":
+                await update_cart_item(
+                    connection,
+                    **context,
+                    expected_version=1,
+                    line_id=quote.items[0].line_id,
+                    item=UpdateCartItemRequest(
+                        quantity=2,
+                        option_ids=[large_id],
+                    ),
+                )
+
+            elif case == "expired":
+                # Move the whole test confirmation window into the past.
+                await connection.execute(
+                    """
+                    UPDATE public.quotes SET
+                        created_at=created_at-interval '1 hour',
+                        expires_at=expires_at-interval '1 hour',
+                        pickup_at=pickup_at-interval '1 hour',
+                        readback_completed_at=
+                            readback_completed_at-interval '1 hour',
+                        confirmed_at=confirmed_at-interval '1 hour'
+                    WHERE id=$1
+                    """,
+                    quote.quote_id,
+                )
+
+            elif case == "wrong_customer":
+                target["customer_id"] = uuid4()
+
+            elif case == "wrong_cart":
+                target["cart_id"] = uuid4()
+
+            elif case == "missing_quote":
+                target["quote_id"] = uuid4()
+
+            elif case == "different_cart":
+                target["cart_id"] = await connection.fetchval(
+                    """
+                    INSERT INTO public.carts (customer_id)
+                    VALUES ($1) RETURNING id
+                    """,
+                    context["customer_id"],
+                )
+
+            with pytest.raises((CartError, QuoteError)) as error:
+                await place_order(connection, **target)
+            assert error.value.code == code
+
+            assert await connection.fetchval("SELECT count(*) FROM public.orders") == 0
+            assert (
+                await connection.fetchval("SELECT count(*) FROM public.order_events")
+                == 0
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["insert_items", "append_placed_event"],
+)
+def test_order_failure_rolls_back_all_writes(
+    database_settings: Settings, monkeypatch, stage
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, _, _, quote = await prepare_pending_quote(connection)
+            confirmation = await confirm_test_quote(connection, context, quote)
+            original = getattr(OrderRepository, stage)
+
+            async def fail_after_write(self, *args):
+                await original(self, *args)
+                raise OSError("simulated order failure")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(OrderRepository, stage, fail_after_write)
+
+                with pytest.raises(OSError):
+                    await place_order(
+                        connection,
+                        **context,
+                        quote_id=quote.quote_id,
+                    )
+
+            for table in (
+                "orders",
+                "order_items",
+                "order_item_modifiers",
+                "order_events",
+            ):
+                # Fixed test table names, never user input.
+                assert (
+                    await connection.fetchval(f"SELECT count(*) FROM public.{table}")
+                    == 0
+                )
+
+            cart = await get_cart(connection, **context)
+            assert cart.status == "BUILDING"
+            assert cart.version == 1
+
+            state = await quote_state(connection, quote.quote_id)
+            assert state["is_pending"] is True
+            assert state["confirmed_at"] == confirmation.confirmed_at
+
+            # The connection and confirmation remain usable after rollback.
+            order = await place_order(
+                connection,
+                **context,
+                quote_id=quote.quote_id,
+            )
+            assert order.status == "PLACED"
+
+    asyncio.run(scenario())
+
+
+def test_committed_order_survives_new_app(database_settings: Settings):
+    async def scenario():
+        async with committed_cart_data(database_settings) as d:
+            context = {
+                "cart_id": d.cart_id,
+                "customer_id": d.customer_id,
+            }
+
+            async with database_app(database_settings) as first_app:
+                async with first_app.state.db_pool.acquire(timeout=5) as connection:
+                    # Build a test offer without changing shared settings.
+                    async with connection.transaction():
+                        cart = await get_cart(connection, **context)
+                        quote = build_quote(
+                            cart,
+                            RestaurantConfiguration(
+                                restaurant_name="Order Persistence Test",
+                                ordering_enabled=True,
+                                preparation_minutes=20,
+                                tax_rate_bps=1000,
+                                hours=[
+                                    OpeningPeriod(
+                                        weekday=day,
+                                        opens_minute=0,
+                                        closes_minute=1440,
+                                    )
+                                    for day in range(7)
+                                ],
+                            ),
+                            await connection.fetchval("SELECT clock_timestamp()"),
+                        )
+
+                        repository = QuoteRepository(connection)
+                        await repository.insert(quote)
+                        await repository.make_pending(quote.quote_id, d.cart_id)
+
+                    await confirm_test_quote(connection, context, quote)
+                    saved = await place_order(
+                        connection,
+                        **context,
+                        quote_id=quote.quote_id,
+                    )
+
+            async with database_app(database_settings) as second_app:
+                async with second_app.state.db_pool.acquire(timeout=5) as connection:
+                    try:
+                        loaded = await get_order(
+                            connection,
+                            order_id=saved.order_id,
+                            customer_id=d.customer_id,
+                        )
+
+                        assert loaded == saved
+
+                        cart = await get_cart(connection, **context)
+                        assert cart.status == "CHECKED_OUT"
+
+                        event_count = await connection.fetchval(
+                            """
+                            SELECT count(*)
+                            FROM public.order_events
+                            WHERE order_id = $1
+                            """,
+                            saved.order_id,
+                        )
+
+                        assert event_count == 1
+
+                    finally:
+                        # Clean up the committed order before the
+                        # committed_cart_data fixture deletes the cart.
+                        async with connection.transaction():
+                            await connection.execute(
+                                """
+                                DELETE FROM public.order_events
+                                WHERE order_id = $1
+                                """,
+                                saved.order_id,
+                            )
+
+                            await connection.execute(
+                                """
+                                DELETE FROM public.orders
+                                WHERE id = $1
+                                """,
+                                saved.order_id,
+                            )
 
     asyncio.run(scenario())
