@@ -20,6 +20,7 @@ from app.repositories.menu_admin import MenuAdminRepository
 from app.repositories.quote import QuoteRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
 from app.schemas.cart import AddCartItemRequest, UpdateCartItemRequest
+from app.schemas.restaurant_config import OpeningPeriod, RestaurantConfiguration
 from app.schemas.selection import SelectionRequest
 from app.services.cart import (
     CartError,
@@ -29,7 +30,14 @@ from app.services.cart import (
     update_cart_item,
 )
 from app.services.menu_selection import SelectionError, validate_selection
-from app.services.quote import QuoteError, create_quote, get_quote
+from app.services.quote import (
+    QuoteError,
+    build_quote,
+    complete_quote_readback,
+    confirm_quote,
+    create_quote,
+    get_quote,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -2395,5 +2403,497 @@ def test_failed_quote_insert_rolls_back(
             cart = await get_cart(connection, **context)
             assert cart.version == 1
             assert cart.subtotal_cents == 1699
+
+    asyncio.run(scenario())
+
+
+async def prepare_pending_quote(connection: asyncpg.Connection):
+    context, item_id, large_id = await prepare_quote_cart(connection)
+
+    await add_cart_item(
+        connection,
+        **context,
+        expected_version=0,
+        item=AddCartItemRequest(item_id=item_id, option_ids=[large_id]),
+    )
+
+    quote = await create_quote(connection, **context, expected_version=1)
+    return context, item_id, large_id, quote
+
+
+async def quote_state(connection: asyncpg.Connection, quote_id: UUID):
+    return await connection.fetchrow(
+        """
+        SELECT is_pending, readback_token, confirmed_at
+        FROM public.quotes WHERE id=$1
+        """,
+        quote_id,
+    )
+
+
+def test_confirmation_requires_readback_and_explicit_answer(
+    database_settings: Settings,
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, _, _, quote = await prepare_pending_quote(connection)
+            target = {**context, "quote_id": quote.quote_id}
+
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(
+                    connection,
+                    **target,
+                    readback_token=uuid4(),
+                    answer="yes",
+                )
+            assert error.value.code == "quote_not_read_back"
+
+            receipt = await complete_quote_readback(connection, **target)
+
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(
+                    connection,
+                    **target,
+                    readback_token=uuid4(),
+                    answer="yes",
+                )
+            assert error.value.code == "quote_readback_mismatch"
+
+            for answer in ("maybe", "yes but add one", "", True):
+                with pytest.raises(QuoteError) as error:
+                    await confirm_quote(
+                        connection,
+                        **target,
+                        readback_token=receipt.readback_token,
+                        answer=answer,
+                    )
+                assert error.value.code == "explicit_confirmation_required"
+
+            state = await quote_state(connection, quote.quote_id)
+            assert state["confirmed_at"] is None
+
+            args = {
+                **target,
+                "readback_token": receipt.readback_token,
+                "answer": " YES ",
+            }
+            first = await confirm_quote(connection, **args)
+
+            assert first is not None and first.cart_version == 1
+            assert first.confirmed_at >= receipt.completed_at
+            assert await confirm_quote(connection, **args) == first
+            assert (await get_cart(connection, **context)).version == 1
+
+            newer = await complete_quote_readback(connection, **target)
+            assert newer.readback_token != receipt.readback_token
+
+            state = await quote_state(connection, quote.quote_id)
+            assert state["confirmed_at"] is None
+
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(connection, **args)
+            assert error.value.code == "quote_readback_mismatch"
+
+            args["readback_token"] = newer.readback_token
+            assert await confirm_quote(connection, **args) is not None
+
+            args["answer"] = "no"
+            assert await confirm_quote(connection, **args) is None
+
+            state = await quote_state(connection, quote.quote_id)
+            assert state["is_pending"] is False
+
+            args["answer"] = "yes"
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(connection, **args)
+            assert error.value.code == "quote_not_pending"
+
+    asyncio.run(scenario())
+
+
+def test_requote_replaces_confirmation_at_same_version(
+    database_settings: Settings,
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, _, _, first = await prepare_pending_quote(connection)
+            target = {**context, "quote_id": first.quote_id}
+
+            receipt = await complete_quote_readback(connection, **target)
+            await confirm_quote(
+                connection,
+                **target,
+                readback_token=receipt.readback_token,
+                answer="yes",
+            )
+
+            second = await create_quote(connection, **context, expected_version=1)
+
+            assert first.cart_version == second.cart_version == 1
+            assert first.quote_id != second.quote_id
+            assert not (await quote_state(connection, first.quote_id))["is_pending"]
+            assert (await quote_state(connection, second.quote_id))["is_pending"]
+
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(
+                    connection,
+                    **target,
+                    readback_token=receipt.readback_token,
+                    answer="yes",
+                )
+            assert error.value.code == "quote_not_pending"
+
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(
+                    connection,
+                    **context,
+                    quote_id=second.quote_id,
+                    readback_token=receipt.readback_token,
+                    answer="yes",
+                )
+            assert error.value.code == "quote_not_read_back"
+
+            with pytest.raises(asyncpg.UniqueViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        "UPDATE public.quotes SET is_pending=true WHERE id=$1",
+                        first.quote_id,
+                    )
+
+            with pytest.raises(asyncpg.CheckViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        """
+                        UPDATE public.quotes
+                        SET confirmed_at=clock_timestamp() WHERE id=$1
+                        """,
+                        second.quote_id,
+                    )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["add", "update", "remove"])
+def test_cart_edits_invalidate_confirmation(
+    database_settings: Settings, operation: str
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, item_id, large_id, quote = await prepare_pending_quote(connection)
+            target = {**context, "quote_id": quote.quote_id}
+
+            receipt = await complete_quote_readback(connection, **target)
+            args = {
+                **target,
+                "readback_token": receipt.readback_token,
+                "answer": "yes",
+            }
+            saved = await confirm_quote(connection, **args)
+
+            if operation == "add":
+                await add_cart_item(
+                    connection,
+                    **context,
+                    expected_version=1,
+                    item=AddCartItemRequest(
+                        item_id=item_id,
+                        option_ids=[large_id],
+                    ),
+                )
+            elif operation == "update":
+                await update_cart_item(
+                    connection,
+                    **context,
+                    expected_version=1,
+                    line_id=quote.items[0].line_id,
+                    item=UpdateCartItemRequest(
+                        quantity=2,
+                        option_ids=[large_id],
+                    ),
+                )
+            else:
+                await remove_cart_item(
+                    connection,
+                    **context,
+                    expected_version=1,
+                    line_id=quote.items[0].line_id,
+                )
+
+            state = await quote_state(connection, quote.quote_id)
+            assert state["is_pending"] is False
+            assert state["confirmed_at"] == saved.confirmed_at
+            assert (await get_cart(connection, **context)).version == 2
+
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(connection, **args)
+            assert error.value.code == "quote_stale"
+
+    asyncio.run(scenario())
+
+
+def test_failed_changes_preserve_confirmation(database_settings: Settings, monkeypatch):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, _, _, quote = await prepare_pending_quote(connection)
+            target = {**context, "quote_id": quote.quote_id}
+
+            receipt = await complete_quote_readback(connection, **target)
+            args = {
+                **target,
+                "readback_token": receipt.readback_token,
+                "answer": "yes",
+            }
+            saved = await confirm_quote(connection, **args)
+
+            # A rejected edit must restore both the version and pending quote.
+            with pytest.raises(SelectionError):
+                await update_cart_item(
+                    connection,
+                    **context,
+                    expected_version=1,
+                    line_id=quote.items[0].line_id,
+                    item=UpdateCartItemRequest(quantity=2, option_ids=[]),
+                )
+
+            assert (await get_cart(connection, **context)).version == 1
+            assert await confirm_quote(connection, **args) == saved
+
+            # A failure after replacement must restore the previous quote.
+            original = QuoteRepository.make_pending
+
+            async def fail_after_replacing(self, quote_id, cart_id):
+                await original(self, quote_id, cart_id)
+                raise OSError("simulated replacement failure")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    QuoteRepository,
+                    "make_pending",
+                    fail_after_replacing,
+                )
+                with pytest.raises(OSError):
+                    await create_quote(connection, **context, expected_version=1)
+
+            assert await confirm_quote(connection, **args) == saved
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM public.quotes WHERE cart_id=$1",
+                    context["cart_id"],
+                )
+                == 1
+            )
+
+            # A failure after writing confirmation must roll back that write.
+            receipt = await complete_quote_readback(connection, **target)
+            args["readback_token"] = receipt.readback_token
+            original_confirmation = QuoteRepository.record_confirmation
+
+            async def fail_after_confirmation(self, quote_id, confirmed_at):
+                await original_confirmation(self, quote_id, confirmed_at)
+                raise OSError("simulated confirmation failure")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    QuoteRepository,
+                    "record_confirmation",
+                    fail_after_confirmation,
+                )
+                with pytest.raises(OSError):
+                    await confirm_quote(connection, **args)
+
+            state = await quote_state(connection, quote.quote_id)
+            assert state["confirmed_at"] is None
+            assert await confirm_quote(connection, **args) is not None
+
+    asyncio.run(scenario())
+
+
+def test_confirmation_enforces_context_status_and_expiry(
+    database_settings: Settings,
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, _, _, quote = await prepare_pending_quote(connection)
+            target = {**context, "quote_id": quote.quote_id}
+            receipt = await complete_quote_readback(connection, **target)
+
+            for operation in (complete_quote_readback, confirm_quote):
+                extra = (
+                    {}
+                    if operation is complete_quote_readback
+                    else {
+                        "readback_token": receipt.readback_token,
+                        "answer": "yes",
+                    }
+                )
+
+                for wrong in (
+                    {**target, "customer_id": uuid4()},
+                    {**target, "cart_id": uuid4()},
+                ):
+                    with pytest.raises(CartError) as error:
+                        await operation(connection, **wrong, **extra)
+                    assert error.value.code == "cart_not_found"
+
+                with pytest.raises(QuoteError) as error:
+                    await operation(
+                        connection,
+                        **{**target, "quote_id": uuid4()},
+                        **extra,
+                    )
+                assert error.value.code == "quote_not_found"
+
+            await connection.execute(
+                "UPDATE public.carts SET status='CHECKED_OUT' WHERE id=$1",
+                context["cart_id"],
+            )
+
+            with pytest.raises(QuoteError) as error:
+                await confirm_quote(
+                    connection,
+                    **target,
+                    readback_token=receipt.readback_token,
+                    answer="yes",
+                )
+            assert error.value.code == "cart_not_quotable"
+
+            await connection.execute(
+                "UPDATE public.carts SET status='BUILDING' WHERE id=$1",
+                context["cart_id"],
+            )
+
+            # Insert an expired test snapshot without sleeping.
+            expired = quote.model_copy(
+                update={
+                    "quote_id": uuid4(),
+                    "created_at": quote.created_at - timedelta(hours=1),
+                    "expires_at": quote.expires_at - timedelta(hours=1),
+                    "pickup_at": quote.pickup_at - timedelta(hours=1),
+                }
+            )
+
+            repository = QuoteRepository(connection)
+            await repository.insert(expired)
+            await repository.make_pending(expired.quote_id, context["cart_id"])
+
+            token = uuid4()
+            await repository.record_readback(
+                expired.quote_id,
+                token,
+                expired.created_at + timedelta(seconds=1),
+            )
+
+            target["quote_id"] = expired.quote_id
+
+            for operation in (complete_quote_readback, confirm_quote):
+                extra = (
+                    {}
+                    if operation is complete_quote_readback
+                    else {"readback_token": token, "answer": "yes"}
+                )
+
+                with pytest.raises(QuoteError) as error:
+                    await operation(connection, **target, **extra)
+                assert error.value.code == "quote_expired"
+
+            state = await quote_state(connection, expired.quote_id)
+            assert state["confirmed_at"] is None
+
+    asyncio.run(scenario())
+
+
+def test_confirmation_waits_for_cart_edit(database_settings: Settings):
+    async def scenario():
+        async with committed_cart_data(database_settings) as d:
+            context = {
+                "cart_id": d.cart_id,
+                "customer_id": d.customer_id,
+            }
+
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    # A test-only quote avoids changing shared settings.
+                    async with first.transaction():
+                        cart = await get_cart(first, **context)
+                        quote = build_quote(
+                            cart,
+                            RestaurantConfiguration(
+                                restaurant_name="Confirmation Test",
+                                ordering_enabled=True,
+                                preparation_minutes=20,
+                                tax_rate_bps=1000,
+                                hours=[
+                                    OpeningPeriod(
+                                        weekday=day,
+                                        opens_minute=0,
+                                        closes_minute=1440,
+                                    )
+                                    for day in range(7)
+                                ],
+                            ),
+                            await first.fetchval("SELECT clock_timestamp()"),
+                        )
+
+                        repository = QuoteRepository(first)
+                        await repository.insert(quote)
+                        await repository.make_pending(quote.quote_id, d.cart_id)
+
+                    target = {**context, "quote_id": quote.quote_id}
+                    receipt = await complete_quote_readback(first, **target)
+
+                    pending = None
+                    try:
+                        async with first.transaction():
+                            await update_cart_item(
+                                first,
+                                **context,
+                                expected_version=1,
+                                line_id=d.line_id,
+                                item=UpdateCartItemRequest(
+                                    quantity=2,
+                                    option_ids=[d.regular_id],
+                                ),
+                            )
+
+                            pending = asyncio.create_task(
+                                confirm_quote(
+                                    second,
+                                    **target,
+                                    readback_token=receipt.readback_token,
+                                    answer="yes",
+                                )
+                            )
+
+                            async with asyncio.timeout(3):
+                                while not await first.fetchval(
+                                    """
+                                    SELECT $1::integer =
+                                        ANY(pg_blocking_pids($2::integer))
+                                    """,
+                                    first.get_server_pid(),
+                                    second.get_server_pid(),
+                                ):
+                                    if pending.done():
+                                        pending.result()
+                                        pytest.fail(
+                                            "Confirmation did not wait "
+                                            "for the cart lock"
+                                        )
+                                    await asyncio.sleep(0.01)
+
+                        with pytest.raises(QuoteError) as error:
+                            await asyncio.wait_for(pending, timeout=5)
+
+                        assert error.value.code == "quote_stale"
+                        state = await quote_state(first, quote.quote_id)
+                        assert state["confirmed_at"] is None
+                    finally:
+                        if pending is not None:
+                            if not pending.done():
+                                pending.cancel()
+                            await asyncio.gather(pending, return_exceptions=True)
 
     asyncio.run(scenario())

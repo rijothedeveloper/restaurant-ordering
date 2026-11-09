@@ -127,7 +127,7 @@ class CartRepository:
         )
 
     async def advance_version(self, cart_id: UUID, expected_version: int) -> int | None:
-        return await self.connection.fetchval(
+        version = await self.connection.fetchval(
             """
             UPDATE public.carts SET version = version + 1
             WHERE id = $1 AND version = $2
@@ -136,3 +136,14 @@ class CartRepository:
             cart_id,
             expected_version,
         )
+
+        if version is not None:
+            await self.connection.execute(
+                """
+                UPDATE public.quotes SET is_pending = false
+                WHERE cart_id = $1 AND is_pending
+                """,
+                cart_id,
+            )
+
+        return version

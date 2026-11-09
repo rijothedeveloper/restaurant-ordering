@@ -61,3 +61,72 @@ class QuoteRepository:
         checked_at = data.pop("checked_at")
 
         return QuoteResponse.model_validate(data), current_version, checked_at
+
+    async def clear_pending(self, cart_id: UUID) -> None:
+        await self.connection.execute(
+            """
+            UPDATE public.quotes SET is_pending = false
+            WHERE cart_id = $1 AND is_pending
+            """,
+            cart_id,
+        )
+
+    async def make_pending(self, quote_id: UUID, cart_id: UUID) -> None:
+        # Caller must hold the cart lock inside a transaction.
+        await self.clear_pending(cart_id)
+
+        activated = await self.connection.fetchval(
+            """
+            UPDATE public.quotes SET is_pending = true
+            WHERE id = $1 AND cart_id = $2
+            RETURNING id
+            """,
+            quote_id,
+            cart_id,
+        )
+        if activated is None:
+            raise RuntimeError("Cannot activate a missing quote")
+
+    async def get_confirmation_state_for_update(
+        self, quote_id: UUID, cart_id: UUID
+    ) -> asyncpg.Record | None:
+        return await self.connection.fetchrow(
+            """
+            SELECT cart_version, expires_at, is_pending, readback_token,
+                   readback_completed_at, confirmed_at
+            FROM public.quotes
+            WHERE id = $1 AND cart_id = $2
+            FOR UPDATE
+            """,
+            quote_id,
+            cart_id,
+        )
+
+    async def record_readback(
+        self, quote_id: UUID, token: UUID, completed_at: datetime
+    ) -> None:
+        await self.connection.execute(
+            """
+            UPDATE public.quotes
+            SET readback_token = $2, readback_completed_at = $3,
+                confirmed_at = NULL
+            WHERE id = $1
+            """,
+            quote_id,
+            token,
+            completed_at,
+        )
+
+    async def record_confirmation(
+        self, quote_id: UUID, confirmed_at: datetime
+    ) -> datetime:
+        return await self.connection.fetchval(
+            """
+            UPDATE public.quotes
+            SET confirmed_at = COALESCE(confirmed_at, $2)
+            WHERE id = $1
+            RETURNING confirmed_at
+            """,
+            quote_id,
+            confirmed_at,
+        )

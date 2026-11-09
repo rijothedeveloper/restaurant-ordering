@@ -33,3 +33,16 @@ class QuoteResponse(BaseModel):
     created_at: AwareDatetime
     expires_at: AwareDatetime
     pickup_at: AwareDatetime
+
+
+class QuoteReadback(BaseModel):
+    quote_id: UUID
+    readback_token: UUID
+    completed_at: AwareDatetime
+
+
+class QuoteConfirmation(BaseModel):
+    quote_id: UUID
+    cart_id: UUID
+    cart_version: int = Field(ge=0)
+    confirmed_at: AwareDatetime

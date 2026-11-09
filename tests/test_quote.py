@@ -6,6 +6,7 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
+from app.repositories.cart import CartRepository
 from app.repositories.quote import QuoteRepository
 from app.schemas.cart import CartLine, CartLineIssue, CartResponse
 from app.schemas.menu import ModifierOption
@@ -15,6 +16,7 @@ from app.services.quote import (
     QuoteError,
     build_quote,
     calculate_tax,
+    confirm_quote,
     create_quote,
     get_quote,
 )
@@ -208,3 +210,61 @@ def test_quote_read_checks_expiry_and_version(monkeypatch, offset, version, code
         with pytest.raises(QuoteError) as error:
             asyncio.run(operation)
         assert error.value.code == code
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_confirmation_expiry_boundary(monkeypatch, offset):
+    quote = build_quote(sample_cart(), sample_config(), NOW)
+    token = uuid4()
+    checked_at = quote.expires_at + timedelta(microseconds=offset)
+
+    connection = MagicMock(spec=asyncpg.Connection)
+    connection.transaction.return_value.__aenter__ = AsyncMock()
+    connection.transaction.return_value.__aexit__ = AsyncMock(return_value=False)
+    connection.fetchval = AsyncMock(return_value=checked_at)
+
+    monkeypatch.setattr(
+        CartRepository,
+        "get_status_for_update",
+        AsyncMock(return_value="BUILDING"),
+    )
+    monkeypatch.setattr(
+        CartRepository,
+        "get_version",
+        AsyncMock(return_value=4),
+    )
+    monkeypatch.setattr(
+        QuoteRepository,
+        "get_confirmation_state_for_update",
+        AsyncMock(
+            return_value={
+                "cart_version": 4,
+                "expires_at": quote.expires_at,
+                "is_pending": True,
+                "readback_token": token,
+                "readback_completed_at": NOW,
+                "confirmed_at": None,
+            }
+        ),
+    )
+
+    write = AsyncMock(return_value=checked_at)
+    monkeypatch.setattr(QuoteRepository, "record_confirmation", write)
+
+    operation = confirm_quote(
+        connection,
+        quote_id=quote.quote_id,
+        cart_id=quote.cart_id,
+        customer_id=uuid4(),
+        readback_token=token,
+        answer="yes",
+    )
+
+    if offset < 0:
+        assert asyncio.run(operation).confirmed_at == checked_at
+    else:
+        with pytest.raises(QuoteError) as error:
+            asyncio.run(operation)
+
+        assert error.value.code == "quote_expired"
+        write.assert_not_awaited()

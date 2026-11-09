@@ -3,10 +3,17 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
+from app.repositories.cart import CartRepository
 from app.repositories.quote import QuoteRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
 from app.schemas.cart import CartResponse
-from app.schemas.quote import QuoteLine, QuoteOption, QuoteResponse
+from app.schemas.quote import (
+    QuoteConfirmation,
+    QuoteLine,
+    QuoteOption,
+    QuoteReadback,
+    QuoteResponse,
+)
 from app.schemas.restaurant_config import RestaurantConfiguration
 from app.services.cart import CartError, get_cart
 from app.services.opening_hours import is_open_now
@@ -142,7 +149,9 @@ async def create_quote(
 
         now = await connection.fetchval("SELECT clock_timestamp()")
         quote = build_quote(cart, config, now)
-        await QuoteRepository(connection).insert(quote)
+        repository = QuoteRepository(connection)
+        await repository.insert(quote)
+        await repository.make_pending(quote.quote_id, cart_id)
 
     return quote
 
@@ -172,3 +181,109 @@ async def get_quote(
         raise QuoteError("quote_expired", "This quote expired. Request a new quote.")
 
     return quote
+
+
+async def _require_pending_quote(
+    connection: asyncpg.Connection,
+    quote_id: UUID,
+    cart_id: UUID,
+    customer_id: UUID,
+) -> tuple[asyncpg.Record, datetime]:
+    # Call only inside a transaction. Always lock cart before quote.
+    carts = CartRepository(connection)
+
+    status = await carts.get_status_for_update(cart_id, customer_id)
+    if status is None:
+        raise CartError("cart_not_found", "Cart was not found.")
+    if status != "BUILDING":
+        raise QuoteError("cart_not_quotable", "This cart cannot be confirmed.")
+
+    row = await QuoteRepository(connection).get_confirmation_state_for_update(
+        quote_id, cart_id
+    )
+    if row is None:
+        raise QuoteError("quote_not_found", "Quote was not found.")
+
+    version = await carts.get_version(cart_id)
+    now = await connection.fetchval("SELECT clock_timestamp()")
+
+    if row["cart_version"] != version:
+        raise QuoteError("quote_stale", "The cart changed. Request a new quote.")
+    if not row["is_pending"]:
+        raise QuoteError("quote_not_pending", "This quote is no longer pending.")
+    if now >= row["expires_at"]:
+        raise QuoteError("quote_expired", "This quote expired. Request a new quote.")
+
+    return row, now
+
+
+async def complete_quote_readback(
+    connection: asyncpg.Connection,
+    *,
+    quote_id: UUID,
+    cart_id: UUID,
+    customer_id: UUID,
+) -> QuoteReadback:
+    """Trusted adapter calls this after delivering the full quote."""
+    async with connection.transaction():
+        _, now = await _require_pending_quote(
+            connection, quote_id, cart_id, customer_id
+        )
+
+        token = uuid4()
+        await QuoteRepository(connection).record_readback(quote_id, token, now)
+
+        result = QuoteReadback(
+            quote_id=quote_id,
+            readback_token=token,
+            completed_at=now,
+        )
+
+    return result
+
+
+async def confirm_quote(
+    connection: asyncpg.Connection,
+    *,
+    quote_id: UUID,
+    cart_id: UUID,
+    customer_id: UUID,
+    readback_token: UUID,
+    answer: str,
+) -> QuoteConfirmation | None:
+    """Local simulator: an explicit yes confirms; no dismisses the quote."""
+    async with connection.transaction():
+        row, now = await _require_pending_quote(
+            connection, quote_id, cart_id, customer_id
+        )
+
+        if row["readback_completed_at"] is None:
+            raise QuoteError("quote_not_read_back", "Read the full quote first.")
+        if row["readback_token"] != readback_token:
+            raise QuoteError(
+                "quote_readback_mismatch",
+                "Answer the latest quote readback.",
+            )
+
+        normalized = answer.strip().casefold() if isinstance(answer, str) else ""
+        if normalized not in {"yes", "no"}:
+            raise QuoteError(
+                "explicit_confirmation_required",
+                "Enter exactly yes or no.",
+            )
+
+        repository = QuoteRepository(connection)
+
+        if normalized == "no":
+            await repository.clear_pending(cart_id)
+            result = None
+        else:
+            confirmed_at = await repository.record_confirmation(quote_id, now)
+            result = QuoteConfirmation(
+                quote_id=quote_id,
+                cart_id=cart_id,
+                cart_version=row["cart_version"],
+                confirmed_at=confirmed_at,
+            )
+
+    return result
