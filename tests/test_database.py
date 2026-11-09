@@ -2,6 +2,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -16,6 +17,7 @@ from app.main import create_app
 from app.repositories.cart import CartRepository
 from app.repositories.menu import MenuRepository
 from app.repositories.menu_admin import MenuAdminRepository
+from app.repositories.quote import QuoteRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
 from app.schemas.cart import AddCartItemRequest, UpdateCartItemRequest
 from app.schemas.selection import SelectionRequest
@@ -27,6 +29,7 @@ from app.services.cart import (
     update_cart_item,
 )
 from app.services.menu_selection import SelectionError, validate_selection
+from app.services.quote import QuoteError, create_quote, get_quote
 
 pytestmark = pytest.mark.integration
 
@@ -2166,5 +2169,231 @@ def test_committed_cart_survives_new_app(database_settings: Settings) -> None:
 
                     assert changed.version == 3
                     assert changed.subtotal_cents == 6796
+
+    asyncio.run(scenario())
+
+
+async def prepare_quote_cart(connection: asyncpg.Connection):
+    cart_id, customer_id, item_id, _, large_id = await create_cart_test_data(connection)
+
+    await connection.execute(
+        """
+        UPDATE public.restaurant_settings
+        SET tax_rate_bps=1000, ordering_enabled=true, preparation_minutes=20
+        WHERE id=1
+        """
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.opening_hours (weekday, opens_minute, closes_minute)
+        SELECT day, 0, 1440 FROM generate_series(0, 6) AS day
+        """
+    )
+
+    return {"cart_id": cart_id, "customer_id": customer_id}, item_id, large_id
+
+
+def test_quotes_preserve_snapshots_and_cart_version(
+    database_settings: Settings,
+) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            context, item_id, large_id = await prepare_quote_cart(connection)
+
+            added = await add_cart_item(
+                connection,
+                **context,
+                expected_version=0,
+                item=AddCartItemRequest(
+                    item_id=item_id, option_ids=[large_id], quantity=2
+                ),
+            )
+
+            first = await create_quote(
+                connection, **context, expected_version=added.version
+            )
+
+            assert first.cart_version == 1
+            assert (first.subtotal_cents, first.tax_cents, first.total_cents) == (
+                3398,
+                340,
+                3738,
+            )
+            assert first.expires_at - first.created_at == timedelta(minutes=2)
+            assert first.pickup_at - first.expires_at == timedelta(minutes=20)
+            assert first.items[0].options[0].option_id == large_id
+            assert first.items[0].line_id == added.line_id
+            assert (await get_cart(connection, **context)).version == 1
+
+            await connection.execute(
+                "UPDATE public.menu_items SET price_cents=1499 WHERE id=$1",
+                item_id,
+            )
+            await connection.execute(
+                """
+                UPDATE public.modifier_options
+                SET name='XL', price_delta_cents=350 WHERE id=$1
+                """,
+                large_id,
+            )
+            await connection.execute(
+                "UPDATE public.restaurant_settings SET tax_rate_bps=500 WHERE id=1"
+            )
+
+            # The saved quote still contains the original name and prices.
+            assert (
+                await get_quote(connection, **context, quote_id=first.quote_id) == first
+            )
+
+            newer = await create_quote(connection, **context, expected_version=1)
+            assert newer.quote_id != first.quote_id
+            assert newer.cart_version == first.cart_version
+            assert newer.items[0].options[0].name == "XL"
+            assert (newer.subtotal_cents, newer.tax_cents, newer.total_cents) == (
+                3698,
+                185,
+                3883,
+            )
+
+            await update_cart_item(
+                connection,
+                **context,
+                expected_version=1,
+                line_id=added.line_id,
+                item=UpdateCartItemRequest(quantity=3, option_ids=[large_id]),
+            )
+
+            with pytest.raises(QuoteError) as stale:
+                await get_quote(connection, **context, quote_id=first.quote_id)
+            assert stale.value.code == "quote_stale"
+
+            with pytest.raises(CartError) as conflict:
+                await create_quote(connection, **context, expected_version=1)
+            assert conflict.value.code == "cart_version_conflict"
+
+            count = await connection.fetchval(
+                "SELECT count(*) FROM public.quotes WHERE cart_id=$1",
+                context["cart_id"],
+            )
+            assert count == 2
+
+    asyncio.run(scenario())
+
+
+def test_quote_guards_and_expiry(database_settings: Settings) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            context, item_id, large_id = await prepare_quote_cart(connection)
+
+            with pytest.raises(QuoteError) as empty:
+                await create_quote(connection, **context, expected_version=0)
+            assert empty.value.code == "empty_cart"
+
+            await add_cart_item(
+                connection,
+                **context,
+                expected_version=0,
+                item=AddCartItemRequest(item_id=item_id, option_ids=[large_id]),
+            )
+
+            for wrong in (
+                {**context, "customer_id": uuid4()},
+                {**context, "cart_id": uuid4()},
+            ):
+                with pytest.raises(CartError) as error:
+                    await create_quote(connection, **wrong, expected_version=1)
+                assert error.value.code == "cart_not_found"
+
+            await connection.execute(
+                "UPDATE public.restaurant_settings SET tax_rate_bps=NULL WHERE id=1"
+            )
+            with pytest.raises(QuoteError) as error:
+                await create_quote(connection, **context, expected_version=1)
+            assert error.value.code == "tax_not_configured"
+
+            await connection.execute(
+                "UPDATE public.restaurant_settings SET tax_rate_bps=0 WHERE id=1"
+            )
+            await connection.execute(
+                "UPDATE public.modifier_options SET is_available=false WHERE id=$1",
+                large_id,
+            )
+            with pytest.raises(QuoteError) as error:
+                await create_quote(connection, **context, expected_version=1)
+            assert error.value.code == "invalid_cart"
+
+            count = await connection.fetchval(
+                "SELECT count(*) FROM public.quotes WHERE cart_id=$1",
+                context["cart_id"],
+            )
+            assert count == 0
+
+            await connection.execute(
+                "UPDATE public.modifier_options SET is_available=true WHERE id=$1",
+                large_id,
+            )
+            quote = await create_quote(connection, **context, expected_version=1)
+            assert quote.tax_cents == 0
+
+            for wrong in (
+                {**context, "customer_id": uuid4()},
+                {**context, "cart_id": uuid4()},
+            ):
+                with pytest.raises(QuoteError) as error:
+                    await get_quote(connection, **wrong, quote_id=quote.quote_id)
+                assert error.value.code == "quote_not_found"
+
+            # Insert an old snapshot to exercise expiry without waiting two minutes.
+            old = quote.model_copy(
+                update={
+                    "quote_id": uuid4(),
+                    "created_at": quote.created_at - timedelta(hours=1),
+                    "expires_at": quote.expires_at - timedelta(hours=1),
+                    "pickup_at": quote.pickup_at - timedelta(hours=1),
+                }
+            )
+            await QuoteRepository(connection).insert(old)
+
+            with pytest.raises(QuoteError) as error:
+                await get_quote(connection, **context, quote_id=old.quote_id)
+            assert error.value.code == "quote_expired"
+
+    asyncio.run(scenario())
+
+
+def test_failed_quote_insert_rolls_back(
+    database_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        async with isolated_data(database_settings) as connection:
+            context, item_id, large_id = await prepare_quote_cart(connection)
+
+            await add_cart_item(
+                connection,
+                **context,
+                expected_version=0,
+                item=AddCartItemRequest(item_id=item_id, option_ids=[large_id]),
+            )
+
+            original = QuoteRepository.insert
+
+            async def fail_after_insert(self, quote):
+                await original(self, quote)
+                raise OSError("simulated failure after quote insertion")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(QuoteRepository, "insert", fail_after_insert)
+                with pytest.raises(OSError):
+                    await create_quote(connection, **context, expected_version=1)
+
+            count = await connection.fetchval(
+                "SELECT count(*) FROM public.quotes WHERE cart_id=$1",
+                context["cart_id"],
+            )
+            assert count == 0
+
+            cart = await get_cart(connection, **context)
+            assert cart.version == 1
+            assert cart.subtotal_cents == 1699
 
     asyncio.run(scenario())

@@ -10,8 +10,8 @@ class RestaurantConfigurationRepository:
     async def get(self) -> RestaurantConfiguration | None:
         rows = await self.connection.fetch(
             """
-            SELECT s.name, s.preparation_minutes, s.ordering_enabled,
-                   h.weekday, h.opens_minute, h.closes_minute
+            SELECT s.name, s.preparation_minutes, s.ordering_enabled, s.tax_rate_bps,
+                h.weekday, h.opens_minute, h.closes_minute
             FROM public.restaurant_settings AS s
             LEFT JOIN public.opening_hours AS h ON true
             WHERE s.id = 1
@@ -25,6 +25,7 @@ class RestaurantConfigurationRepository:
         return RestaurantConfiguration(
             restaurant_name=first["name"],
             preparation_minutes=first["preparation_minutes"],
+            tax_rate_bps=first["tax_rate_bps"],
             ordering_enabled=first["ordering_enabled"],
             hours=[
                 OpeningPeriod(

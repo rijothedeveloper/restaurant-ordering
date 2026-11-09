@@ -19,6 +19,7 @@ class RestaurantConfiguration(BaseModel):
     restaurant_name: str
     preparation_minutes: int = Field(ge=1, le=180)
     ordering_enabled: bool
+    tax_rate_bps: int | None = Field(default=None, ge=0, le=10000)
     hours: list[OpeningPeriod] = Field(default_factory=list)
 
     @model_validator(mode="after")
