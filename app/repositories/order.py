@@ -144,3 +144,30 @@ class OrderRepository:
             items.append(data)
 
         return OrderResponse.model_validate({**dict(row), "items": items})
+
+    async def get_for_cart(
+        self, cart_id: UUID, customer_id: UUID
+    ) -> OrderResponse | None:
+        order_id = await self.connection.fetchval(
+            """
+            SELECT id FROM public.orders
+            WHERE cart_id = $1 AND customer_id = $2
+            """,
+            cart_id,
+            customer_id,
+        )
+        if order_id is None:
+            return None
+
+        return await self.get(order_id, customer_id)
+
+    async def lock_catalog(self) -> None:
+        # Short checkout transaction only.
+        await self.connection.execute(
+            """
+            LOCK TABLE public.restaurant_settings, public.opening_hours,
+                       public.menu_categories, public.menu_items,
+                       public.modifier_groups, public.modifier_options
+            IN SHARE MODE
+            """
+        )

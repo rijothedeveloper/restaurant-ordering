@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, Field
 
-from app.schemas.quote import QuoteLine
+from app.schemas.quote import QuoteLine, QuoteResponse
 
 
 class OrderResponse(BaseModel):
@@ -34,3 +34,9 @@ class OrderResponse(BaseModel):
     confirmed_at: AwareDatetime
     placed_at: AwareDatetime
     pickup_at: AwareDatetime
+
+
+class CheckoutNeedsReview(BaseModel):
+    code: str
+    message: str
+    quote: QuoteResponse | None = None

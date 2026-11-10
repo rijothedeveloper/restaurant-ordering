@@ -12,6 +12,7 @@ from app.schemas.cart import CartLine, CartLineIssue, CartResponse
 from app.schemas.menu import ModifierOption
 from app.schemas.restaurant_config import OpeningPeriod, RestaurantConfiguration
 from app.services.cart import CartError
+from app.services.order import validate_quote_for_placement
 from app.services.quote import (
     QuoteError,
     build_quote,
@@ -268,3 +269,232 @@ def test_confirmation_expiry_boundary(monkeypatch, offset):
 
         assert error.value.code == "quote_expired"
         write.assert_not_awaited()
+
+
+@pytest.mark.parametrize("seconds", [0, 90, 119])
+def test_placement_preserves_promised_pickup(seconds):
+    cart, config = sample_cart(), sample_config()
+    quote = build_quote(cart, config, NOW)
+
+    validate_quote_for_placement(
+        quote,
+        cart,
+        config,
+        NOW + timedelta(seconds=seconds),
+    )
+
+    assert quote.pickup_at == NOW + timedelta(minutes=22)
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_placement_rejects_expiry_boundary(offset):
+    cart, config = sample_cart(), sample_config()
+    quote = build_quote(cart, config, NOW)
+
+    with pytest.raises(QuoteError) as error:
+        validate_quote_for_placement(
+            quote,
+            cart,
+            config,
+            quote.expires_at + timedelta(microseconds=offset),
+        )
+
+    assert error.value.code == "quote_expired"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "price",
+        "item_name",
+        "option_name",
+        "option_breakdown",
+        "tax",
+        "quantity",
+        "preparation",
+    ],
+)
+def test_placement_detects_changed_offer(change):
+    cart, config = sample_cart(), sample_config()
+    quote = build_quote(cart, config, NOW)
+    line = cart.items[0]
+
+    if change == "price":
+        line.unit_price_cents += 100
+    elif change == "item_name":
+        line.item_name = "Different bowl"
+    elif change == "option_name":
+        line.options[0].name = "XL"
+    elif change == "option_breakdown":
+        # Modifier prices matter even if the final total is unchanged.
+        line.options[0].price_delta_cents += 100
+    elif change == "tax":
+        config.tax_rate_bps = 500
+    elif change == "quantity":
+        line.quantity += 1
+    else:
+        config.preparation_minutes = 60
+
+    line.line_total_cents = line.unit_price_cents * line.quantity
+    cart.subtotal_cents = line.line_total_cents
+
+    with pytest.raises(QuoteError) as error:
+        validate_quote_for_placement(quote, cart, config, NOW)
+
+    assert error.value.code == "quote_changed"
+
+
+@pytest.mark.parametrize(
+    "case,code",
+    [
+        ("paused", "ordering_paused"),
+        ("tax", "tax_not_configured"),
+        ("closed", "restaurant_closed"),
+        ("invalid", "invalid_cart"),
+        ("version", "quote_stale"),
+        ("cart", "quote_stale"),
+        ("status", "cart_not_quotable"),
+    ],
+)
+def test_placement_checks_current_conditions(case, code):
+    cart, config = sample_cart(), sample_config()
+    quote = build_quote(cart, config, NOW)
+
+    if case == "paused":
+        config.ordering_enabled = False
+    elif case == "tax":
+        config.tax_rate_bps = None
+    elif case == "closed":
+        config.hours = []
+    elif case == "invalid":
+        cart.items[0].issue = CartLineIssue(
+            code="option_unavailable",
+            message="Unavailable",
+        )
+        cart.subtotal_cents = None
+    elif case == "version":
+        cart.version += 1
+    elif case == "cart":
+        cart.cart_id = uuid4()
+    else:
+        cart.status = "CHECKED_OUT"
+
+    with pytest.raises(QuoteError) as error:
+        validate_quote_for_placement(quote, cart, config, NOW)
+
+    assert error.value.code == code
+
+
+def test_placement_can_honor_pickup_when_a_new_quote_would_close_too_late():
+    cart, config = sample_cart(), sample_config()
+    config.hours = [
+        OpeningPeriod(
+            weekday=0,
+            opens_minute=660,
+            closes_minute=683,
+        )
+    ]
+    quote = build_quote(cart, config, NOW)
+    later = NOW + timedelta(seconds=90)
+
+    # The existing pickup promise still fits.
+    validate_quote_for_placement(quote, cart, config, later)
+
+    # A new two-minute confirmation window would push pickup too late.
+    with pytest.raises(QuoteError) as error:
+        build_quote(cart, config, later)
+
+    assert error.value.code == "pickup_unavailable"
+
+
+@pytest.mark.parametrize(
+    "periods",
+    [
+        [(660, 682)],
+        [(660, 665), (680, 720)],
+    ],
+)
+def test_placement_detects_changed_closing_or_break(periods):
+    cart, config = sample_cart(), sample_config()
+    quote = build_quote(cart, config, NOW)
+
+    config.hours = [
+        OpeningPeriod(
+            weekday=0,
+            opens_minute=start,
+            closes_minute=end,
+        )
+        for start, end in periods
+    ]
+
+    with pytest.raises(QuoteError) as error:
+        validate_quote_for_placement(quote, cart, config, NOW)
+
+    assert error.value.code == "quote_changed"
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_placement_preparation_time_boundary(offset):
+    cart, config = sample_cart(), sample_config()
+    quote = build_quote(cart, config, NOW)
+    config.preparation_minutes = 21
+    now = NOW + timedelta(minutes=1, microseconds=offset)
+
+    if offset == 0:
+        validate_quote_for_placement(quote, cart, config, now)
+    else:
+        with pytest.raises(QuoteError) as error:
+            validate_quote_for_placement(quote, cart, config, now)
+
+        assert error.value.code == "quote_changed"
+
+
+def test_placement_uses_elapsed_time_across_dst_fallback():
+    cart, config = sample_cart(), sample_config()
+    config.hours = [
+        OpeningPeriod(
+            weekday=6,
+            opens_minute=60,
+            closes_minute=120,
+        )
+    ]
+    now = datetime(2026, 11, 1, 8, 50, tzinfo=UTC)
+    quote = build_quote(cart, config, now)
+
+    validate_quote_for_placement(
+        quote,
+        cart,
+        config,
+        now + timedelta(minutes=1),
+    )
+
+    assert quote.pickup_at == datetime(2026, 11, 1, 9, 12, tzinfo=UTC)
+
+
+def test_placement_requires_aware_time():
+    cart, config = sample_cart(), sample_config()
+    quote = build_quote(cart, config, NOW)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        validate_quote_for_placement(
+            quote,
+            cart,
+            config,
+            NOW.replace(tzinfo=None),
+        )
+
+
+def test_placement_ignores_line_display_order():
+    cart, config = sample_cart(), sample_config()
+    cart.items.append(
+        cart.items[0].model_copy(
+            deep=True,
+            update={"line_id": uuid4()},
+        )
+    )
+    cart.subtotal_cents *= 2
+    quote = build_quote(cart, config, NOW)
+
+    cart.items.reverse()
+
+    validate_quote_for_placement(quote, cart, config, NOW)

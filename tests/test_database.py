@@ -21,6 +21,7 @@ from app.repositories.order import OrderRepository
 from app.repositories.quote import QuoteRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
 from app.schemas.cart import AddCartItemRequest, UpdateCartItemRequest
+from app.schemas.order import CheckoutNeedsReview, OrderResponse
 from app.schemas.restaurant_config import OpeningPeriod, RestaurantConfiguration
 from app.schemas.selection import SelectionRequest
 from app.services.cart import (
@@ -1929,7 +1930,11 @@ def test_cart_versions_and_conflicts(database_settings: Settings) -> None:
 
 
 @asynccontextmanager
-async def committed_cart_data(settings: Settings) -> AsyncIterator[SimpleNamespace]:
+async def committed_cart_data(
+    settings: Settings,
+    *,
+    checkout_ready: bool = False,
+) -> AsyncIterator[SimpleNamespace]:
     d = SimpleNamespace(
         customer_id=uuid4(),
         cart_id=uuid4(),
@@ -1953,6 +1958,31 @@ async def committed_cart_data(settings: Settings) -> AsyncIterator[SimpleNamespa
                         ON CONFLICT (id) DO NOTHING RETURNING id
                         """
                     )
+
+                    if checkout_ready:
+                        if created is None or await connection.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM public.opening_hours)"
+                        ):
+                            pytest.fail(
+                                "Checkout tests require empty settings and hours"
+                            )
+
+                        await connection.execute(
+                            """
+                            UPDATE public.restaurant_settings
+                            SET ordering_enabled=true,
+                                tax_rate_bps=1000,
+                                preparation_minutes=20
+                            WHERE id=1
+                            """
+                        )
+                        await connection.execute(
+                            """
+                            INSERT INTO public.opening_hours
+                            SELECT day, 0, 1440
+                            FROM generate_series(0,6) AS day
+                            """
+                        )
 
                     await connection.execute(
                         "INSERT INTO public.customers (id) VALUES ($1)",
@@ -2025,28 +2055,125 @@ async def committed_cart_data(settings: Settings) -> AsyncIterator[SimpleNamespa
         async with database_app(settings) as app:
             async with app.state.db_pool.acquire(timeout=5) as connection:
                 async with connection.transaction():
-                    # Identifiers are fixed test constants; values are parameters.
-                    for table, column, value in (
-                        ("carts", "id", d.cart_id),
-                        ("customers", "id", d.customer_id),
-                        ("modifier_options", "group_id", d.group_id),
-                        ("modifier_groups", "id", d.group_id),
-                        ("menu_items", "id", d.item_id),
-                        ("menu_categories", "id", d.category_id),
-                    ):
-                        await connection.execute(
-                            f"DELETE FROM public.{table} WHERE {column}=$1",
-                            value,
-                        )
-                        await connection.execute(
-                            "DELETE FROM public.orders WHERE cart_id=$1",
-                            d.cart_id,
+                    # 1. Delete orders before carts.
+
+                    await connection.execute(
+                        "DELETE FROM public.orders WHERE cart_id=$1",
+                        d.cart_id,
+                    )
+
+                    # 2. Delete the cart and customer.
+
+                    await connection.execute(
+                        "DELETE FROM public.carts WHERE id=$1",
+                        d.cart_id,
+                    )
+
+                    await connection.execute(
+                        "DELETE FROM public.customers WHERE id=$1",
+                        d.customer_id,
+                    )
+
+                    # 3. Delete ALL modifier options belonging
+
+                    # to groups associated with this test menu item.
+
+                    await connection.execute(
+                        """
+
+                        DELETE FROM public.modifier_options
+
+                        WHERE group_id IN (
+
+                            SELECT id
+
+                            FROM public.modifier_groups
+
+                            WHERE menu_item_id=$1
+
                         )
 
+                        """,
+                        d.item_id,
+                    )
+
+                    # 4. Delete ALL modifier groups belonging
+
+                    # to this menu item, including groups created
+
+                    # during the concurrency tests.
+
+                    await connection.execute(
+                        """
+
+                        DELETE FROM public.modifier_groups
+
+                        WHERE menu_item_id=$1
+
+                        """,
+                        d.item_id,
+                    )
+
+                    # 5. Delete the menu item.
+
+                    await connection.execute(
+                        "DELETE FROM public.menu_items WHERE id=$1",
+                        d.item_id,
+                    )
+
+                    # 6. Delete its category.
+
+                    await connection.execute(
+                        "DELETE FROM public.menu_categories WHERE id=$1",
+                        d.category_id,
+                    )
+
+                    # 7. Remove settings created by this fixture.
+
                     if created_settings:
+                        if checkout_ready:
+                            await connection.execute("DELETE FROM public.opening_hours")
+
                         await connection.execute(
-                            "DELETE FROM public.restaurant_settings WHERE id=1"
+                            """
+
+                            DELETE FROM public.restaurant_settings
+
+                            WHERE id=1
+
+                            """
                         )
+
+
+@asynccontextmanager
+async def confirmed_checkout_data(settings: Settings):
+    async with committed_cart_data(
+        settings,
+        checkout_ready=True,
+    ) as d:
+        d.context = {
+            "cart_id": d.cart_id,
+            "customer_id": d.customer_id,
+        }
+
+        async with database_app(settings) as app:
+            async with app.state.db_pool.acquire(timeout=5) as connection:
+                d.quote = await create_quote(
+                    connection,
+                    **d.context,
+                    expected_version=1,
+                )
+                await confirm_test_quote(
+                    connection,
+                    d.context,
+                    d.quote,
+                )
+
+        d.target = {
+            **d.context,
+            "quote_id": d.quote.quote_id,
+        }
+        yield d
 
 
 def test_concurrent_cart_edits_reject_waiting_stale_writer(
@@ -3019,9 +3146,14 @@ def test_order_copies_confirmed_snapshot(database_settings: Settings):
             assert error.value.code == "cart_not_editable"
 
             # Lesson 4 will change this retry into a saved-order response.
-            with pytest.raises(QuoteError) as error:
-                await place_order(connection, **context, quote_id=quote.quote_id)
-            assert error.value.code == "cart_not_quotable"
+            assert (
+                await place_order(
+                    connection,
+                    **context,
+                    quote_id=quote.quote_id,
+                )
+                == order
+            )
 
             # The database also rejects a second order for this cart.
             with pytest.raises(asyncpg.UniqueViolationError):
@@ -3229,90 +3361,483 @@ def test_order_failure_rolls_back_all_writes(
 
 def test_committed_order_survives_new_app(database_settings: Settings):
     async def scenario():
-        async with committed_cart_data(database_settings) as d:
-            context = {
-                "cart_id": d.cart_id,
-                "customer_id": d.customer_id,
-            }
-
+        async with confirmed_checkout_data(database_settings) as d:
             async with database_app(database_settings) as first_app:
                 async with first_app.state.db_pool.acquire(timeout=5) as connection:
-                    # Build a test offer without changing shared settings.
-                    async with connection.transaction():
-                        cart = await get_cart(connection, **context)
-                        quote = build_quote(
-                            cart,
-                            RestaurantConfiguration(
-                                restaurant_name="Order Persistence Test",
-                                ordering_enabled=True,
-                                preparation_minutes=20,
-                                tax_rate_bps=1000,
-                                hours=[
-                                    OpeningPeriod(
-                                        weekday=day,
-                                        opens_minute=0,
-                                        closes_minute=1440,
-                                    )
-                                    for day in range(7)
-                                ],
-                            ),
-                            await connection.fetchval("SELECT clock_timestamp()"),
+                    saved = await place_order(connection, **d.target)
+                    assert isinstance(saved, OrderResponse)
+
+            async with database_app(database_settings) as second_app:
+                async with second_app.state.db_pool.acquire(timeout=5) as connection:
+                    loaded = await get_order(
+                        connection,
+                        order_id=saved.order_id,
+                        customer_id=d.customer_id,
+                    )
+                    assert loaded == saved
+                    assert await place_order(connection, **d.target) == saved
+
+                    cart = await get_cart(connection, **d.context)
+                    assert cart.status == "CHECKED_OUT"
+
+                    assert (
+                        await connection.fetchval(
+                            """
+                            SELECT count(*) FROM public.order_events
+                            WHERE order_id=$1
+                            """,
+                            saved.order_id,
                         )
+                        == 1
+                    )
 
-                        repository = QuoteRepository(connection)
-                        await repository.insert(quote)
-                        await repository.make_pending(quote.quote_id, d.cart_id)
+    asyncio.run(scenario())
 
-                    await confirm_test_quote(connection, context, quote)
-                    saved = await place_order(
+
+async def expire_test_quote(connection, quote_id):
+    # Test-only timestamp adjustment; no real waiting is needed.
+    await connection.execute(
+        """
+        UPDATE public.quotes SET
+            created_at=created_at-interval '1 hour',
+            expires_at=expires_at-interval '1 hour',
+            pickup_at=pickup_at-interval '1 hour',
+            readback_completed_at=readback_completed_at-interval '1 hour',
+            confirmed_at=confirmed_at-interval '1 hour'
+        WHERE id=$1
+        """,
+        quote_id,
+    )
+
+
+def test_checkout_retry_recovers_saved_order(database_settings: Settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, item_id, _, quote = await prepare_pending_quote(connection)
+            await confirm_test_quote(connection, context, quote)
+            target = {**context, "quote_id": quote.quote_id}
+
+            saved = await place_order(connection, **target)
+            assert isinstance(saved, OrderResponse)
+
+            await expire_test_quote(connection, quote.quote_id)
+            await connection.execute(
+                """
+                UPDATE public.restaurant_settings
+                SET ordering_enabled=false, tax_rate_bps=500
+                WHERE id=1
+                """
+            )
+            await connection.execute(
+                """
+                UPDATE public.menu_items
+                SET price_cents=9999, is_available=false
+                WHERE id=$1
+                """,
+                item_id,
+            )
+
+            assert await place_order(connection, **target) == saved
+
+            with pytest.raises(OrderError) as error:
+                await place_order(
+                    connection,
+                    **{**target, "quote_id": uuid4()},
+                )
+            assert error.value.code == "order_quote_mismatch"
+
+            with pytest.raises(CartError) as error:
+                await place_order(
+                    connection,
+                    **{**target, "customer_id": uuid4()},
+                )
+            assert error.value.code == "cart_not_found"
+
+            assert await connection.fetchval("SELECT count(*) FROM public.orders") == 1
+            assert (
+                await connection.fetchval("SELECT count(*) FROM public.order_events")
+                == 1
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "change,code,has_quote",
+    [
+        ("item_price", "quote_changed", True),
+        ("option_price", "quote_changed", True),
+        ("item_name", "quote_changed", True),
+        ("option_name", "quote_changed", True),
+        ("tax", "quote_changed", True),
+        ("preparation", "quote_changed", True),
+        ("item_unavailable", "invalid_cart", False),
+        ("option_unavailable", "invalid_cart", False),
+        ("required_group", "invalid_cart", False),
+        ("group_limits", "invalid_cart", False),
+        ("paused", "ordering_paused", False),
+        ("closed", "restaurant_closed", False),
+        ("tax_missing", "tax_not_configured", False),
+    ],
+)
+def test_checkout_revalidates_and_requires_review(
+    database_settings, change, code, has_quote
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, item_id, large_id, quote = await prepare_pending_quote(connection)
+            await confirm_test_quote(connection, context, quote)
+
+            changes = {
+                "item_price": (
+                    "UPDATE public.menu_items SET price_cents=1499 WHERE id=$1",
+                    [item_id],
+                ),
+                "option_price": (
+                    "UPDATE public.modifier_options "
+                    "SET price_delta_cents=400 WHERE id=$1",
+                    [large_id],
+                ),
+                "item_name": (
+                    "UPDATE public.menu_items SET name='New bowl' WHERE id=$1",
+                    [item_id],
+                ),
+                "option_name": (
+                    "UPDATE public.modifier_options SET name='XL' WHERE id=$1",
+                    [large_id],
+                ),
+                "tax": (
+                    "UPDATE public.restaurant_settings SET tax_rate_bps=500 WHERE id=1",
+                    [],
+                ),
+                "preparation": (
+                    "UPDATE public.restaurant_settings "
+                    "SET preparation_minutes=60 WHERE id=1",
+                    [],
+                ),
+                "item_unavailable": (
+                    "UPDATE public.menu_items SET is_available=false WHERE id=$1",
+                    [item_id],
+                ),
+                "option_unavailable": (
+                    "UPDATE public.modifier_options SET is_available=false WHERE id=$1",
+                    [large_id],
+                ),
+                "required_group": (
+                    "INSERT INTO public.modifier_groups "
+                    "(menu_item_id,name,min_selections,max_selections) "
+                    "VALUES ($1,'New requirement',1,1)",
+                    [item_id],
+                ),
+                "group_limits": (
+                    "UPDATE public.modifier_groups "
+                    "SET min_selections=2,max_selections=2 "
+                    "WHERE menu_item_id=$1",
+                    [item_id],
+                ),
+                "paused": (
+                    "UPDATE public.restaurant_settings "
+                    "SET ordering_enabled=false WHERE id=1",
+                    [],
+                ),
+                "closed": (
+                    "DELETE FROM public.opening_hours",
+                    [],
+                ),
+                "tax_missing": (
+                    "UPDATE public.restaurant_settings "
+                    "SET tax_rate_bps=NULL WHERE id=1",
+                    [],
+                ),
+            }
+
+            sql, arguments = changes[change]
+            await connection.execute(sql, *arguments)
+
+            result = await place_order(
+                connection,
+                **context,
+                quote_id=quote.quote_id,
+            )
+
+            assert isinstance(result, CheckoutNeedsReview)
+            assert result.code == code
+            assert (result.quote is not None) is has_quote
+
+            old_state = await quote_state(connection, quote.quote_id)
+            assert old_state["is_pending"] is False
+
+            cart = await get_cart(connection, **context)
+            assert cart.status == "BUILDING"
+            assert cart.version == 1
+
+            assert await connection.fetchval("SELECT count(*) FROM public.orders") == 0
+
+            if result.quote is not None:
+                replacement = result.quote
+                assert replacement.quote_id != quote.quote_id
+                assert replacement.cart_version == quote.cart_version
+
+                state = await quote_state(connection, replacement.quote_id)
+                assert state["is_pending"]
+                assert state["confirmed_at"] is None
+
+                with pytest.raises(QuoteError) as error:
+                    await place_order(
+                        connection,
+                        **context,
+                        quote_id=replacement.quote_id,
+                    )
+                assert error.value.code == "quote_not_confirmed"
+
+                await confirm_test_quote(
+                    connection,
+                    context,
+                    replacement,
+                )
+                order = await place_order(
+                    connection,
+                    **context,
+                    quote_id=replacement.quote_id,
+                )
+
+                assert isinstance(order, OrderResponse)
+                assert order.items == replacement.items
+                assert order.total_cents == replacement.total_cents
+                assert order.pickup_at == replacement.pickup_at
+
+            elif change == "paused":
+                await connection.execute(
+                    """
+                    UPDATE public.restaurant_settings
+                    SET ordering_enabled=true WHERE id=1
+                    """
+                )
+                with pytest.raises(QuoteError) as error:
+                    await place_order(
+                        connection,
+                        **context,
+                        quote_id=quote.quote_id,
+                    )
+                assert error.value.code == "quote_not_pending"
+
+    asyncio.run(scenario())
+
+
+def test_failed_requote_rolls_back_checkout_changes(database_settings, monkeypatch):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, item_id, _, quote = await prepare_pending_quote(connection)
+            confirmation = await confirm_test_quote(connection, context, quote)
+
+            await connection.execute(
+                "UPDATE public.menu_items SET price_cents=1499 WHERE id=$1",
+                item_id,
+            )
+
+            original = QuoteRepository.make_pending
+
+            async def fail_after_replacement(self, *args):
+                await original(self, *args)
+                raise OSError("simulated requote failure")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    QuoteRepository,
+                    "make_pending",
+                    fail_after_replacement,
+                )
+                with pytest.raises(OSError):
+                    await place_order(
                         connection,
                         **context,
                         quote_id=quote.quote_id,
                     )
 
-            async with database_app(database_settings) as second_app:
-                async with second_app.state.db_pool.acquire(timeout=5) as connection:
+            state = await quote_state(connection, quote.quote_id)
+            assert state["is_pending"]
+            assert state["confirmed_at"] == confirmation.confirmed_at
+
+            assert await connection.fetchval("SELECT count(*) FROM public.quotes") == 1
+            assert await connection.fetchval("SELECT count(*) FROM public.orders") == 0
+
+            cart = await get_cart(connection, **context)
+            assert cart.status == "BUILDING"
+
+            result = await place_order(
+                connection,
+                **context,
+                quote_id=quote.quote_id,
+            )
+            assert isinstance(result, CheckoutNeedsReview)
+            assert result.quote is not None
+
+    asyncio.run(scenario())
+
+
+async def wait_for_database_block(blocker, waiter, task):
+    async with asyncio.timeout(3):
+        while not await blocker.fetchval(
+            "SELECT $1::integer = ANY(pg_blocking_pids($2::integer))",
+            blocker.get_server_pid(),
+            waiter.get_server_pid(),
+        ):
+            if task.done():
+                task.result()
+                pytest.fail("Expected the second operation to wait for a database lock")
+
+            await asyncio.sleep(0.01)
+
+
+async def settle_test_task(task):
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_concurrent_checkout_returns_one_order(database_settings):
+    async def scenario():
+        async with confirmed_checkout_data(database_settings) as d:
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    pending = None
                     try:
+                        async with first.transaction():
+                            saved = await place_order(first, **d.target)
+                            assert isinstance(saved, OrderResponse)
+
+                            pending = asyncio.create_task(
+                                place_order(second, **d.target)
+                            )
+                            await wait_for_database_block(first, second, pending)
+
+                        assert await asyncio.wait_for(pending, timeout=5) == saved
+                        assert (
+                            await first.fetchval(
+                                """
+                                SELECT count(*) FROM public.orders
+                                WHERE cart_id=$1
+                                """,
+                                d.cart_id,
+                            )
+                            == 1
+                        )
+                        assert (
+                            await first.fetchval(
+                                """
+                                SELECT count(*) FROM public.order_events
+                                WHERE order_id=$1
+                                """,
+                                saved.order_id,
+                            )
+                            == 1
+                        )
+                    finally:
+                        await settle_test_task(pending)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["price", "expiry"])
+def test_checkout_checks_again_after_catalog_wait(database_settings, change):
+    async def scenario():
+        async with confirmed_checkout_data(database_settings) as d:
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    pending = None
+                    try:
+                        async with first.transaction():
+                            await first.execute(
+                                "LOCK TABLE public.menu_items IN ROW EXCLUSIVE MODE"
+                            )
+
+                            pending = asyncio.create_task(
+                                place_order(second, **d.target)
+                            )
+                            await wait_for_database_block(first, second, pending)
+
+                            if change == "price":
+                                await MenuAdminRepository(first).update_item(
+                                    d.item_id, 1499, None
+                                )
+                            else:
+                                await expire_test_quote(first, d.quote.quote_id)
+
+                        if change == "price":
+                            result = await asyncio.wait_for(pending, timeout=5)
+                            assert isinstance(result, CheckoutNeedsReview)
+                            assert result.quote.items[0].unit_price_cents == 1499
+                        else:
+                            with pytest.raises(QuoteError) as error:
+                                await asyncio.wait_for(pending, timeout=5)
+                            assert error.value.code == "quote_expired"
+
+                        assert (
+                            await first.fetchval(
+                                """
+                                SELECT count(*) FROM public.orders
+                                WHERE cart_id=$1
+                                """,
+                                d.cart_id,
+                            )
+                            == 0
+                        )
+                    finally:
+                        await settle_test_task(pending)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["price", "required_group"])
+def test_catalog_changes_wait_for_checkout_commit(database_settings, change):
+    async def scenario():
+        async with confirmed_checkout_data(database_settings) as d:
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    pending = None
+                    try:
+                        async with first.transaction():
+                            saved = await place_order(first, **d.target)
+                            assert isinstance(saved, OrderResponse)
+
+                            if change == "price":
+                                operation = MenuAdminRepository(second).update_item(
+                                    d.item_id, 1499, None
+                                )
+                            else:
+                                operation = second.execute(
+                                    """
+                                    INSERT INTO public.modifier_groups (
+                                        menu_item_id, name,
+                                        min_selections, max_selections
+                                    )
+                                    VALUES ($1,'New requirement',1,1)
+                                    """,
+                                    d.item_id,
+                                )
+
+                            pending = asyncio.create_task(operation)
+                            await wait_for_database_block(first, second, pending)
+
+                        await asyncio.wait_for(pending, timeout=5)
+
                         loaded = await get_order(
-                            connection,
+                            first,
                             order_id=saved.order_id,
                             customer_id=d.customer_id,
                         )
-
                         assert loaded == saved
-
-                        cart = await get_cart(connection, **context)
-                        assert cart.status == "CHECKED_OUT"
-
-                        event_count = await connection.fetchval(
-                            """
-                            SELECT count(*)
-                            FROM public.order_events
-                            WHERE order_id = $1
-                            """,
-                            saved.order_id,
-                        )
-
-                        assert event_count == 1
-
                     finally:
-                        # Clean up the committed order before the
-                        # committed_cart_data fixture deletes the cart.
-                        async with connection.transaction():
-                            await connection.execute(
-                                """
-                                DELETE FROM public.order_events
-                                WHERE order_id = $1
-                                """,
-                                saved.order_id,
-                            )
-
-                            await connection.execute(
-                                """
-                                DELETE FROM public.orders
-                                WHERE id = $1
-                                """,
-                                saved.order_id,
-                            )
+                        await settle_test_task(pending)
 
     asyncio.run(scenario())
