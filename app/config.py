@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Literal, Self
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -26,10 +26,28 @@ class Settings(BaseSettings):
     db_pool_min_size: int = Field(default=1, ge=1)
     db_pool_max_size: int = Field(default=5, ge=1)
 
+    firebase_project_id: str | None = Field(
+        default=None, pattern=r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+    )
+    staff_web_origin: AnyHttpUrl = AnyHttpUrl("http://localhost:3000")
+
     @model_validator(mode="after")
     def validate_pool_sizes(self) -> Self:
         if self.db_pool_min_size > self.db_pool_max_size:
             raise ValueError("db_pool_min_size must be <= db_pool_max_size")
+        return self
+
+    @model_validator(mode="after")
+    def validate_staff_origin(self) -> Self:
+        origin = self.staff_web_origin
+        if (
+            origin.username
+            or origin.password
+            or origin.query
+            or origin.fragment
+            or origin.path not in (None, "/")
+        ):
+            raise ValueError("staff_web_origin must contain only scheme, host and port")
         return self
 
 
