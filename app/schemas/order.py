@@ -40,3 +40,14 @@ class CheckoutNeedsReview(BaseModel):
     code: str
     message: str
     quote: QuoteResponse | None = None
+
+
+class StaffOrderSummary(BaseModel):
+    order_id: UUID
+    order_number: int = Field(gt=0)
+    status: Literal["PLACED", "ACCEPTED", "PREPARING", "READY"]
+    payment_status: Literal["UNPAID", "PAID"]
+    currency: Literal["USD"]
+    total_cents: int = Field(ge=0)
+    placed_at: AwareDatetime
+    pickup_at: AwareDatetime

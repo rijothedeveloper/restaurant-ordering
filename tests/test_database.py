@@ -3841,3 +3841,146 @@ def test_catalog_changes_wait_for_checkout_commit(database_settings, change):
                         await settle_test_task(pending)
 
     asyncio.run(scenario())
+
+
+def test_staff_queue_and_snapshot_details(database_settings):
+    from app.repositories.staff_orders import StaffOrderRepository
+
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, item_id, option_id, quote = await prepare_pending_quote(connection)
+
+            await confirm_test_quote(connection, context, quote)
+
+            first = await place_order(
+                connection,
+                **context,
+                quote_id=quote.quote_id,
+            )
+            assert isinstance(first, OrderResponse)
+
+            # An unfinished order from yesterday must stay visible.
+            await connection.execute(
+                """
+                UPDATE public.orders SET
+                    confirmed_at = confirmed_at - interval '1 day',
+                    placed_at = placed_at - interval '1 day',
+                    pickup_at = pickup_at - interval '1 day'
+                WHERE id = $1
+                """,
+                first.order_id,
+            )
+
+            second_cart = await connection.fetchval(
+                """
+                INSERT INTO public.carts (customer_id)
+                VALUES ($1)
+                RETURNING id
+                """,
+                context["customer_id"],
+            )
+
+            second_context = {
+                **context,
+                "cart_id": second_cart,
+            }
+
+            await add_cart_item(
+                connection,
+                **second_context,
+                expected_version=0,
+                item=AddCartItemRequest(
+                    item_id=item_id,
+                    option_ids=[option_id],
+                ),
+            )
+
+            second_quote = await create_quote(
+                connection,
+                **second_context,
+                expected_version=1,
+            )
+
+            await confirm_test_quote(
+                connection,
+                second_context,
+                second_quote,
+            )
+
+            second = await place_order(
+                connection,
+                **second_context,
+                quote_id=second_quote.quote_id,
+            )
+            assert isinstance(second, OrderResponse)
+
+            repository = StaffOrderRepository(connection)
+
+            assert [row.order_id for row in await repository.list_active()] == [
+                first.order_id,
+                second.order_id,
+            ]
+
+            active_statuses = {
+                "PLACED",
+                "ACCEPTED",
+                "PREPARING",
+                "READY",
+            }
+
+            for status in (
+                "PLACED",
+                "ACCEPTED",
+                "PREPARING",
+                "READY",
+                "COMPLETED",
+                "REJECTED",
+                "CANCELLED",
+            ):
+                await connection.execute(
+                    "UPDATE public.orders SET status=$1 WHERE id=$2",
+                    status,
+                    first.order_id,
+                )
+
+                ids = {row.order_id for row in await repository.list_active()}
+
+                assert (first.order_id in ids) == (status in active_statuses)
+                assert second.order_id in ids
+
+            await connection.execute(
+                """
+                UPDATE public.menu_items
+                SET name='Changed', price_cents=9999
+                WHERE id=$1
+                """,
+                item_id,
+            )
+
+            await connection.execute(
+                """
+                UPDATE public.modifier_options
+                SET name='Changed option', price_delta_cents=999
+                WHERE id=$1
+                """,
+                option_id,
+            )
+
+            detail = await repository.get(first.order_id)
+
+            assert detail is not None
+            assert detail.items == first.items
+            assert detail.total_cents == first.total_cents
+            assert detail.status == "CANCELLED"
+            assert await repository.get(uuid4()) is None
+
+            # Customer-facing reads still require the correct owner.
+            assert (
+                await OrderRepository(connection).get(
+                    first.order_id,
+                    uuid4(),
+                )
+                is None
+            )
+
+    asyncio.run(scenario())

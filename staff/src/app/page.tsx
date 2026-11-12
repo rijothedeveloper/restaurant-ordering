@@ -2,7 +2,7 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import {
-  onIdTokenChanged,
+  onAuthStateChanged,
   signInWithEmailAndPassword,
   signOut,
   type Unsubscribe,
@@ -13,6 +13,8 @@ import {
   getStaffIdentity,
   type StaffIdentity,
 } from "@/lib/auth";
+
+import Kitchen from "@/components/kitchen";
 
 type View =
   | { kind: "loading" }
@@ -40,7 +42,7 @@ export default function StaffPage() {
 
         if (!active) return;
 
-        unsubscribe = onIdTokenChanged(auth, (user) => {
+        unsubscribe = onAuthStateChanged(auth, (user) => {
           if (!active) return;
 
           const current = ++generation;
@@ -127,6 +129,17 @@ export default function StaffPage() {
     }
   }
 
+  if (view.kind === "staff") {
+  return (
+    <Kitchen
+      key={view.identity.user_id}
+      onSignOut={logout}
+      signingOut={busy}
+      signOutError={formError}
+    />
+  );
+}
+
   return (
     <main>
       <section className="card" aria-labelledby="page-title">
@@ -165,18 +178,6 @@ export default function StaffPage() {
               {busy ? "Signing in…" : "Sign in"}
             </button>
           </form>
-        )}
-
-        {view.kind === "staff" && (
-          <>
-            <p className="success" role="status">
-              Staff access confirmed.
-            </p>
-            <p>The kitchen order list comes in the next lesson.</p>
-            <button onClick={logout} disabled={busy}>
-              Sign out
-            </button>
-          </>
         )}
 
         {view.kind === "error" && (

@@ -1,6 +1,6 @@
 "use client";
 
-import { getApps, initializeApp } from "firebase/app";
+import { FirebaseError,  getApps, initializeApp } from "firebase/app";
 import {
   browserSessionPersistence,
   getAuth,
@@ -48,51 +48,141 @@ export function getStaffAuth(): Auth {
   return browserAuth;
 }
 
-export async function getStaffIdentity(
-  user: User,
-): Promise<StaffIdentity> {
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-  if (!apiUrl) {
-    throw new Error("The staff API address is missing.");
+export class StaffApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "StaffApiError";
+  }
+}
+
+export async function staffGet<T>(
+  path: string,
+  signal?: AbortSignal,
+  user: User | null = getStaffAuth().currentUser,
+): Promise<T> {
+  if (!user) {
+    throw new StaffApiError(401, "Please sign in again.");
   }
 
-  let response: Response;
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL;
 
-  try {
-    const token = await user.getIdToken();
+  if (!apiUrl) {
+    throw new StaffApiError(
+      503,
+      "The staff API address is missing.",
+    );
+  }
 
-    response = await fetch(
-      `${apiUrl.replace(/\/$/, "")}/staff/me`,
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+
+  const cancelled = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener(
+      "abort",
+      () =>
+        reject(
+          new StaffApiError(
+            503,
+            "The request did not finish. Please try again.",
+          ),
+        ),
+      { once: true },
+    );
+  });
+
+  signal?.addEventListener("abort", abort, { once: true });
+
+  if (signal?.aborted) {
+    abort();
+  }
+
+  const timer = setTimeout(abort, 10_000);
+
+  async function send(): Promise<T> {
+    const token = await user!.getIdToken();
+
+    controller.signal.throwIfAborted();
+
+    const response = await fetch(
+      `${apiUrl!.replace(/\/$/, "")}${path}`,
       {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
         credentials: "omit",
         cache: "no-store",
-        signal: AbortSignal.timeout(10_000),
+        signal: controller.signal,
       },
     );
-  } catch {
-    throw new Error(
-      "Could not check staff access. Try again or sign out and sign in.",
-    );
+
+    if (response.status === 401) {
+      throw new StaffApiError(
+        401,
+        "Your session expired. Sign out and sign in again.",
+      );
+    }
+
+    if (response.status === 403) {
+      throw new StaffApiError(
+        403,
+        "This account does not have staff access.",
+      );
+    }
+
+    if (response.status === 404) {
+      throw new StaffApiError(404, "Order not found.");
+    }
+
+    if (!response.ok) {
+      throw new StaffApiError(
+        response.status,
+        "Kitchen data is temporarily unavailable.",
+      );
+    }
+
+    return response.json() as Promise<T>;
   }
 
-  if (response.status === 401) {
-    throw new Error(
-      "Your staff session has expired. Sign out and sign in again.",
-    );
-  }
+  try {
+    return await Promise.race([send(), cancelled]);
+  } catch (error) {
+    if (error instanceof StaffApiError) {
+      throw error;
+    }
 
-  if (response.status === 403) {
-    throw new Error(
-      "This account has not been approved for staff access.",
-    );
-  }
+    if (
+      error instanceof FirebaseError &&
+      [
+        "auth/user-disabled",
+        "auth/user-token-expired",
+        "auth/invalid-user-token",
+      ].includes(error.code)
+    ) {
+      throw new StaffApiError(
+        401,
+        "Your session expired. Sign out and sign in again.",
+      );
+    }
 
-  if (!response.ok) {
-    throw new Error(
-      "Staff access could not be checked. Please try again.",
+    throw new StaffApiError(
+      503,
+      "Cannot reach the kitchen service. Check your connection.",
     );
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
   }
+}
 
-  return response.json() as Promise<StaffIdentity>;
+export function getStaffIdentity(
+  user: User,
+): Promise<StaffIdentity> {
+  return staffGet<StaffIdentity>(
+    "/staff/me",
+    undefined,
+    user,
+  );
 }
