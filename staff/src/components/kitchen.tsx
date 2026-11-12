@@ -15,6 +15,7 @@ import {
   type OrderDetails,
   type OrderSummary,
 } from "@/lib/orders";
+import { OrderActions } from "@/components/order-actions";
 
 function beep(context: AudioContext) {
   if (context.state !== "running") return;
@@ -52,6 +53,7 @@ export default function Kitchen({
   const [sound, setSound] = useState(false);
   const [soundError, setSoundError] = useState("");
   const [now, setNow] = useState(0);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   const seen = useRef<Set<string> | null>(null);
   const audio = useRef<AudioContext | null>(null);
@@ -97,10 +99,16 @@ export default function Kitchen({
     [],
   );
 
+  const refreshOrders = useCallback(() => {
+    // Refresh both the active queue and the selected order.
+    setRefreshKey((value) => value + 1);
+  }, []);
+
   const queue = useStaffPolling<OrderSummary[]>(
     denied ? null : "/staff/orders",
     denyAccess,
     receiveOrders,
+    refreshKey,
   );
 
   const detail = useStaffPolling<OrderDetails>(
@@ -108,7 +116,19 @@ export default function Kitchen({
       ? null
       : `/staff/orders/${selected}`,
     denyAccess,
+    undefined,
+    refreshKey,
   );
+
+  const actionsDisabled =
+    signingOut ||
+    queue.refreshing ||
+    detail.refreshing ||
+    Boolean(queue.error || detail.error) ||
+    queue.updatedAt === null ||
+    detail.updatedAt === null ||
+    now - queue.updatedAt > 10_000 ||
+    now - detail.updatedAt > 10_000;
 
   const orders = queue.data ?? [];
 
@@ -404,6 +424,15 @@ export default function Kitchen({
                       </strong>
                     </dd>
                   </dl>
+
+                  <OrderActions
+                    // Reset reason/message state when a different order is selected.
+                    key={detail.data.order_id}
+                    order={detail.data}
+                    disabled={actionsDisabled}
+                    onChanged={refreshOrders}
+                    onAuthError={denyAccess}
+                  />
 
                   <p className="muted">
                     Item prices include selected modifiers.

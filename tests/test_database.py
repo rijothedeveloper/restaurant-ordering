@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,10 +21,12 @@ from app.repositories.menu_admin import MenuAdminRepository
 from app.repositories.order import OrderRepository
 from app.repositories.quote import QuoteRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
+from app.repositories.staff_orders import StaffOrderRepository
 from app.schemas.cart import AddCartItemRequest, UpdateCartItemRequest
 from app.schemas.order import CheckoutNeedsReview, OrderResponse
 from app.schemas.restaurant_config import OpeningPeriod, RestaurantConfiguration
 from app.schemas.selection import SelectionRequest
+from app.schemas.staff_order import StaffOrderStatusChange
 from app.services.cart import (
     CartError,
     add_cart_item,
@@ -40,6 +43,11 @@ from app.services.quote import (
     confirm_quote,
     create_quote,
     get_quote,
+)
+from app.services.staff_orders import (
+    StaffOrderError,
+    change_order_status,
+    mark_order_paid,
 )
 
 pytestmark = pytest.mark.integration
@@ -3982,5 +3990,430 @@ def test_staff_queue_and_snapshot_details(database_settings):
                 )
                 is None
             )
+
+    asyncio.run(scenario())
+
+async def create_staff_test_order(connection):
+    context, _, _, quote = await prepare_pending_quote(connection)
+    await confirm_test_quote(connection, context, quote)
+
+    order = await place_order(
+        connection,
+        **context,
+        quote_id=quote.quote_id,
+    )
+    assert isinstance(order, OrderResponse)
+    return order
+
+
+def test_staff_order_workflow(database_settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            saved = await create_staff_test_order(connection)
+            target = {
+                "order_id": saved.order_id,
+                "staff_user_id": "staff-a",
+            }
+
+            for before, after in [
+                ("PLACED", "ACCEPTED"),
+                ("ACCEPTED", "PREPARING"),
+                ("PREPARING", "READY"),
+            ]:
+                change = StaffOrderStatusChange(
+                    expected_status=before,
+                    status=after,
+                )
+                result = await change_order_status(
+                    connection, **target, change=change
+                )
+
+                # A repeated action must not create another audit event.
+                repeated = await change_order_status(
+                    connection, **target, change=change
+                )
+                assert repeated == result
+                assert result.status == after
+                assert result.payment_status == "UNPAID"
+
+            complete = StaffOrderStatusChange(
+                expected_status="READY",
+                status="COMPLETED",
+            )
+
+            with pytest.raises(StaffOrderError) as error:
+                await change_order_status(
+                    connection, **target, change=complete
+                )
+            assert error.value.code == "payment_required"
+
+            paid = await mark_order_paid(connection, **target)
+            assert paid.status == "READY"
+            assert paid.payment_status == "PAID"
+            assert await mark_order_paid(connection, **target) == paid
+
+            done = await change_order_status(
+                connection, **target, change=complete
+            )
+            assert done.status == "COMPLETED"
+
+            # Staff actions must not change the purchased item or price snapshots.
+            assert done.items == saved.items
+            assert done.total_cents == saved.total_cents
+            assert await mark_order_paid(connection, **target) == done
+            assert await StaffOrderRepository(connection).list_active() == []
+
+            events = await connection.fetch(
+                """
+                SELECT event_type, data::text AS data
+                FROM public.order_events
+                WHERE order_id = $1
+                ORDER BY id
+                """,
+                saved.order_id,
+            )
+
+            assert [event["event_type"] for event in events] == [
+                "ORDER_PLACED",
+                "ORDER_STATUS_CHANGED",
+                "ORDER_STATUS_CHANGED",
+                "ORDER_STATUS_CHANGED",
+                "ORDER_PAID",
+                "ORDER_STATUS_CHANGED",
+            ]
+
+            assert all(
+                json.loads(event["data"])["staff_user_id"] == "staff-a"
+                for event in events[1:]
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("PLACED", "REJECTED"),
+        ("PLACED", "CANCELLED"),
+        ("ACCEPTED", "CANCELLED"),
+        ("PREPARING", "CANCELLED"),
+        ("READY", "CANCELLED"),
+    ],
+)
+def test_staff_order_close_with_reason(
+    database_settings, before, after
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            saved = await create_staff_test_order(connection)
+
+            # Arrange the starting state directly for this focused test.
+            await connection.execute(
+                "UPDATE public.orders SET status=$2 WHERE id=$1",
+                saved.order_id,
+                before,
+            )
+
+            target = {
+                "order_id": saved.order_id,
+                "staff_user_id": "staff-a",
+            }
+            change = StaffOrderStatusChange(
+                expected_status=before,
+                status=after,
+                reason="  Customer requested  ",
+            )
+
+            result = await change_order_status(
+                connection, **target, change=change
+            )
+            assert result.status == after
+            assert result.payment_status == "UNPAID"
+            assert await StaffOrderRepository(connection).list_active() == []
+
+            reason = await connection.fetchval(
+                """
+                SELECT data->>'reason'
+                FROM public.order_events
+                WHERE order_id=$1
+                  AND event_type='ORDER_STATUS_CHANGED'
+                """,
+                saved.order_id,
+            )
+            assert reason == "Customer requested"
+
+            # Closed orders cannot be reopened using an old screen.
+            with pytest.raises(StaffOrderError) as error:
+                await change_order_status(
+                    connection,
+                    **target,
+                    change=StaffOrderStatusChange(
+                        expected_status="PLACED",
+                        status="ACCEPTED",
+                    ),
+                )
+            assert error.value.code == "stale_order"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "current,expected,target,payment,code",
+    [
+        ("PLACED", "PLACED", "READY", "UNPAID", "invalid_transition"),
+        ("ACCEPTED", "ACCEPTED", "REJECTED", "UNPAID", "invalid_transition"),
+        ("PREPARING", "PLACED", "ACCEPTED", "UNPAID", "stale_order"),
+        ("READY", "READY", "CANCELLED", "PAID", "refund_required"),
+        ("COMPLETED", "PLACED", "ACCEPTED", "PAID", "stale_order"),
+    ],
+)
+def test_staff_order_rejects_invalid_change(
+    database_settings, current, expected, target, payment, code
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            saved = await create_staff_test_order(connection)
+
+            await connection.execute(
+                """
+                UPDATE public.orders
+                SET status=$2, payment_status=$3
+                WHERE id=$1
+                """,
+                saved.order_id,
+                current,
+                payment,
+            )
+
+            change = StaffOrderStatusChange(
+                expected_status=expected,
+                status=target,
+                reason=(
+                    "Not available"
+                    if target in {"REJECTED", "CANCELLED"}
+                    else None
+                ),
+            )
+
+            with pytest.raises(StaffOrderError) as error:
+                await change_order_status(
+                    connection,
+                    order_id=saved.order_id,
+                    staff_user_id="staff-a",
+                    change=change,
+                )
+
+            assert error.value.code == code
+
+            event_count = await connection.fetchval(
+                """
+                SELECT count(*)
+                FROM public.order_events
+                WHERE order_id=$1
+                """,
+                saved.order_id,
+            )
+            assert event_count == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["PLACED", "ACCEPTED", "PREPARING", "REJECTED", "CANCELLED"],
+)
+def test_staff_payment_requires_ready_order(database_settings, status):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            saved = await create_staff_test_order(connection)
+
+            await connection.execute(
+                "UPDATE public.orders SET status=$2 WHERE id=$1",
+                saved.order_id,
+                status,
+            )
+
+            with pytest.raises(StaffOrderError) as error:
+                await mark_order_paid(
+                    connection,
+                    order_id=saved.order_id,
+                    staff_user_id="staff-a",
+                )
+
+            assert error.value.code == "not_ready"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["status", "paid"])
+def test_staff_action_rollback(
+    database_settings, monkeypatch, action
+):
+    original = StaffOrderRepository.append_event
+
+    async def fail_after_event(self, *args):
+        # Fail after both writes have happened, before the transaction commits.
+        await original(self, *args)
+        raise RuntimeError("Simulated failure after audit insert")
+
+    monkeypatch.setattr(
+        StaffOrderRepository,
+        "append_event",
+        fail_after_event,
+    )
+
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            saved = await create_staff_test_order(connection)
+            start = "READY" if action == "paid" else "PLACED"
+
+            await connection.execute(
+                "UPDATE public.orders SET status=$2 WHERE id=$1",
+                saved.order_id,
+                start,
+            )
+
+            target = {
+                "order_id": saved.order_id,
+                "staff_user_id": "staff-a",
+            }
+
+            with pytest.raises(RuntimeError, match="Simulated failure"):
+                if action == "paid":
+                    await mark_order_paid(connection, **target)
+                else:
+                    await change_order_status(
+                        connection,
+                        **target,
+                        change=StaffOrderStatusChange(
+                            expected_status="PLACED",
+                            status="ACCEPTED",
+                        ),
+                    )
+
+            row = await connection.fetchrow(
+                """
+                SELECT status, payment_status
+                FROM public.orders
+                WHERE id=$1
+                """,
+                saved.order_id,
+            )
+            assert dict(row) == {
+                "status": start,
+                "payment_status": "UNPAID",
+            }
+
+            # Only the original ORDER_PLACED event should remain.
+            event_count = await connection.fetchval(
+                """
+                SELECT count(*)
+                FROM public.order_events
+                WHERE order_id=$1
+                """,
+                saved.order_id,
+            )
+            assert event_count == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "first_action,second_action,start,error_code",
+    [
+        ("ACCEPTED", "REJECTED", "PLACED", "stale_order"),
+        ("ACCEPTED", "ACCEPTED", "PLACED", None),
+        ("PAID", "CANCELLED", "READY", "refund_required"),
+        ("CANCELLED", "PAID", "READY", "not_ready"),
+        ("PAID", "PAID", "READY", None),
+    ],
+)
+def test_staff_concurrent_actions(
+    database_settings,
+    first_action,
+    second_action,
+    start,
+    error_code,
+):
+    async def scenario():
+        async with confirmed_checkout_data(database_settings) as d:
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    saved = await place_order(first, **d.target)
+                    assert isinstance(saved, OrderResponse)
+
+                    await first.execute(
+                        "UPDATE public.orders SET status=$2 WHERE id=$1",
+                        saved.order_id,
+                        start,
+                    )
+
+                    async def act(connection, action, actor):
+                        args = {
+                            "order_id": saved.order_id,
+                            "staff_user_id": actor,
+                        }
+
+                        if action == "PAID":
+                            return await mark_order_paid(connection, **args)
+
+                        return await change_order_status(
+                            connection,
+                            **args,
+                            change=StaffOrderStatusChange(
+                                expected_status=start,
+                                status=action,
+                                reason=(
+                                    "Customer requested"
+                                    if action in {"REJECTED", "CANCELLED"}
+                                    else None
+                                ),
+                            ),
+                        )
+
+                    pending = None
+
+                    try:
+                        # Hold the winning transaction open until PostgreSQL
+                        # confirms that the second connection is waiting.
+                        async with first.transaction():
+                            winner = await act(
+                                first, first_action, "staff-a"
+                            )
+                            pending = asyncio.create_task(
+                                act(second, second_action, "staff-b")
+                            )
+                            await wait_for_database_block(
+                                first, second, pending
+                            )
+
+                        if error_code is None:
+                            result = await asyncio.wait_for(pending, 5)
+                            assert result == winner
+                        else:
+                            with pytest.raises(StaffOrderError) as error:
+                                await asyncio.wait_for(pending, 5)
+                            assert error.value.code == error_code
+
+                        current = await StaffOrderRepository(first).get(
+                            saved.order_id
+                        )
+                        assert current == winner
+
+                        event_count = await first.fetchval(
+                            """
+                            SELECT count(*)
+                            FROM public.order_events
+                            WHERE order_id=$1
+                            """,
+                            saved.order_id,
+                        )
+                        assert event_count == 2
+                    finally:
+                        # Settle the task before releasing its connection.
+                        await settle_test_task(pending)
 
     asyncio.run(scenario())

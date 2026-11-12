@@ -5,6 +5,7 @@ import { StaffApiError, staffGet } from "@/lib/auth";
 
 type Snapshot<T> = {
   path: string | null;
+  refreshKey: number;
   data: T | null;
   error: string;
   updatedAt: number | null;
@@ -14,9 +15,11 @@ export function useStaffPolling<T>(
   path: string | null,
   onAuthError: (message: string) => void,
   onData?: (data: T) => void,
+  refreshKey = 0,
 ) {
-  const [snapshot, setSnapshot] = useState<Snapshot<T>>({
+  const [state, setState] = useState<Snapshot<T>>({
     path: null,
+    refreshKey: -1,
     data: null,
     error: "",
     updatedAt: null,
@@ -31,8 +34,6 @@ export function useStaffPolling<T>(
     let timer: ReturnType<typeof setTimeout> | undefined;
     let controller: AbortController | undefined;
 
-    const endpoint = path;
-
     async function poll() {
       if (!active || running || stopped) return;
 
@@ -42,7 +43,7 @@ export function useStaffPolling<T>(
 
       try {
         const data = await staffGet<T>(
-          endpoint,
+          path!,
           controller.signal,
         );
 
@@ -50,8 +51,9 @@ export function useStaffPolling<T>(
 
         onData?.(data);
 
-        setSnapshot({
-          path: endpoint,
+        setState({
+          path,
+          refreshKey,
           data,
           error: "",
           updatedAt: Date.now(),
@@ -62,7 +64,7 @@ export function useStaffPolling<T>(
         const message =
           error instanceof Error
             ? error.message
-            : "Could not load orders.";
+            : "Cannot load orders.";
 
         if (
           error instanceof StaffApiError &&
@@ -70,8 +72,10 @@ export function useStaffPolling<T>(
         ) {
           stopped = true;
 
-          setSnapshot({
-            path: endpoint,
+          // Remove protected data when staff access is lost.
+          setState({
+            path,
+            refreshKey,
             data: null,
             error: message,
             updatedAt: null,
@@ -83,42 +87,42 @@ export function useStaffPolling<T>(
             error instanceof StaffApiError &&
             error.status === 404;
 
-          setSnapshot((previous) => ({
-            path: endpoint,
+          stopped = missing;
+
+          setState((previous) => ({
+            path,
+            refreshKey,
             data:
-              !missing && previous.path === endpoint
+              !missing && previous.path === path
                 ? previous.data
                 : null,
             updatedAt:
-              !missing && previous.path === endpoint
+              !missing && previous.path === path
                 ? previous.updatedAt
                 : null,
             error: message,
           }));
-
-          stopped = missing;
         }
       } finally {
         running = false;
 
+        // Wait until this request finishes before scheduling another.
         if (active && !stopped) {
-          timer = setTimeout(poll, 3000);
+          timer = setTimeout(() => void poll(), 3_000);
         }
       }
     }
 
     const wake = () => {
-      if (document.visibilityState === "visible") {
-        void poll();
-      }
+      if (!document.hidden) void poll();
     };
 
     window.addEventListener("online", wake);
     document.addEventListener("visibilitychange", wake);
-
     void poll();
 
     return () => {
+      // A changed refreshKey invalidates responses from the previous effect.
       active = false;
       clearTimeout(timer);
       controller?.abort();
@@ -126,14 +130,24 @@ export function useStaffPolling<T>(
       window.removeEventListener("online", wake);
       document.removeEventListener("visibilitychange", wake);
     };
-  }, [path, onAuthError, onData]);
+  }, [path, refreshKey, onAuthError, onData]);
 
-  return path && snapshot.path === path
-    ? snapshot
-    : {
-        path,
-        data: null,
-        error: "",
-        updatedAt: null,
-      };
+  if (!path || state.path !== path) {
+    // Never show another order's details while a new selection loads.
+    return {
+      data: null,
+      error: "",
+      updatedAt: null,
+      refreshing: Boolean(path),
+    };
+  }
+
+  return {
+    data: state.data,
+    error: state.error,
+    updatedAt: state.updatedAt,
+
+    // Keep the last snapshot visible, but disable actions while refreshing.
+    refreshing: state.refreshKey !== refreshKey,
+  };
 }

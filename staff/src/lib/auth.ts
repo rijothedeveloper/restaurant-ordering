@@ -1,6 +1,6 @@
 "use client";
 
-import { FirebaseError,  getApps, initializeApp } from "firebase/app";
+import { FirebaseError, getApps, initializeApp } from "firebase/app";
 import {
   browserSessionPersistence,
   getAuth,
@@ -18,7 +18,7 @@ let browserAuth: Auth | undefined;
 
 export function getStaffAuth(): Auth {
   if (typeof window === "undefined") {
-    throw new Error("Staff sign-in is only available in the browser.");
+    throw new Error("Sign-in requires a browser.");
   }
 
   if (browserAuth) return browserAuth;
@@ -31,7 +31,7 @@ export function getStaffAuth(): Auth {
   };
 
   if (Object.values(config).some((value) => !value)) {
-    throw new Error("Staff sign-in configuration is missing.");
+    throw new Error("Staff sign-in is not configured.");
   }
 
   const existing = getApps().find(
@@ -40,10 +40,9 @@ export function getStaffAuth(): Auth {
 
   browserAuth = existing
     ? getAuth(existing)
-    : initializeAuth(
-        initializeApp(config, "restaurant-staff"),
-        { persistence: browserSessionPersistence },
-      );
+    : initializeAuth(initializeApp(config, "restaurant-staff"), {
+        persistence: browserSessionPersistence,
+      });
 
   return browserAuth;
 }
@@ -58,10 +57,21 @@ export class StaffApiError extends Error {
   }
 }
 
-export async function staffGet<T>(
+type RequestOptions = {
+  method?: "GET" | "POST" | "PATCH";
+  body?: unknown;
+  signal?: AbortSignal;
+  user?: User | null;
+};
+
+async function staffRequest<T>(
   path: string,
-  signal?: AbortSignal,
-  user: User | null = getStaffAuth().currentUser,
+  {
+    method = "GET",
+    body,
+    signal,
+    user = getStaffAuth().currentUser,
+  }: RequestOptions = {},
 ): Promise<T> {
   if (!user) {
     throw new StaffApiError(401, "Please sign in again.");
@@ -72,46 +82,49 @@ export async function staffGet<T>(
   if (!apiUrl) {
     throw new StaffApiError(
       503,
-      "The staff API address is missing.",
+      "The staff service is not configured.",
     );
   }
 
   const controller = new AbortController();
-  const abort = () => controller.abort();
+
+  let rejectCancellation: (error: Error) => void = () => {};
 
   const cancelled = new Promise<never>((_, reject) => {
-    controller.signal.addEventListener(
-      "abort",
-      () =>
-        reject(
-          new StaffApiError(
-            503,
-            "The request did not finish. Please try again.",
-          ),
-        ),
-      { once: true },
-    );
+    rejectCancellation = reject;
   });
 
+  const abort = () => {
+    // Aborting the browser request does not undo a server transaction.
+    controller.abort();
+    rejectCancellation(
+      new StaffApiError(503, "The request did not finish."),
+    );
+  };
+
   signal?.addEventListener("abort", abort, { once: true });
-
-  if (signal?.aborted) {
-    abort();
-  }
-
-  const timer = setTimeout(abort, 10_000);
+  const timer = window.setTimeout(abort, 10_000);
 
   async function send(): Promise<T> {
+    controller.signal.throwIfAborted();
+
+    // Ask Firebase for a current ID token for every request.
     const token = await user!.getIdToken();
 
+    // Token retrieval may finish after our timeout; do not send then.
     controller.signal.throwIfAborted();
 
     const response = await fetch(
       `${apiUrl!.replace(/\/$/, "")}${path}`,
       {
+        method,
         headers: {
           Authorization: `Bearer ${token}`,
+          ...(body === undefined
+            ? {}
+            : { "Content-Type": "application/json" }),
         },
+        body: body === undefined ? undefined : JSON.stringify(body),
         credentials: "omit",
         cache: "no-store",
         signal: controller.signal,
@@ -136,6 +149,23 @@ export async function staffGet<T>(
       throw new StaffApiError(404, "Order not found.");
     }
 
+    if (response.status === 409) {
+      const data = await response.json().catch(() => null);
+      const message = data?.detail?.message;
+
+      throw new StaffApiError(
+        409,
+        typeof message === "string" ? message : "Order changed.",
+      );
+    }
+
+    if (response.status === 422) {
+      throw new StaffApiError(
+        422,
+        "Check the action and its reason, then try again.",
+      );
+    }
+
     if (!response.ok) {
       throw new StaffApiError(
         response.status,
@@ -147,11 +177,13 @@ export async function staffGet<T>(
   }
 
   try {
+    if (signal?.aborted) abort();
+
+    // Bound token retrieval as well as HTTP work.
+    // Never automatically retry a write from this helper.
     return await Promise.race([send(), cancelled]);
   } catch (error) {
-    if (error instanceof StaffApiError) {
-      throw error;
-    }
+    if (error instanceof StaffApiError) throw error;
 
     if (
       error instanceof FirebaseError &&
@@ -172,17 +204,29 @@ export async function staffGet<T>(
       "Cannot reach the kitchen service. Check your connection.",
     );
   } finally {
-    clearTimeout(timer);
+    window.clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
   }
+}
+
+export function staffGet<T>(
+  path: string,
+  signal?: AbortSignal,
+  user?: User | null,
+) {
+  return staffRequest<T>(path, { signal, user });
+}
+
+export function staffWrite<T>(
+  path: string,
+  method: "POST" | "PATCH",
+  body?: unknown,
+) {
+  return staffRequest<T>(path, { method, body });
 }
 
 export function getStaffIdentity(
   user: User,
 ): Promise<StaffIdentity> {
-  return staffGet<StaffIdentity>(
-    "/staff/me",
-    undefined,
-    user,
-  );
+  return staffGet<StaffIdentity>("/staff/me", undefined, user);
 }

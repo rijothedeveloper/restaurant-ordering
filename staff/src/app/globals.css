@@ -237,3 +237,42 @@ input:focus-visible {
     padding: 18px;
   }
 }
+
+.order-actions {
+  margin-top: 24px;
+  border-top: 1px solid #d9e2db;
+  padding-top: 16px;
+}
+
+.order-actions fieldset {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.order-actions legend {
+  font-weight: 700;
+}
+
+.order-actions label {
+  display: block;
+  margin-top: 20px;
+}
+
+.order-actions textarea {
+  width: 100%;
+  padding: 10px;
+  font: inherit;
+  border: 1px solid #a5b8ac;
+  border-radius: 8px;
+}
+
+.order-actions .actions {
+  margin-top: 12px;
+}
+
+button.danger {
+  background: white;
+  border-color: #9d2424;
+  color: #9d2424;
+}

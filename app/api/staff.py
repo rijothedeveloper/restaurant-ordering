@@ -9,6 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from app.auth import StaffIdentity, require_staff
 from app.repositories.staff_orders import StaffOrderRepository
 from app.schemas.order import OrderResponse, StaffOrderSummary
+from app.schemas.staff_order import StaffOrderStatusChange
+from app.services.staff_orders import (
+    StaffOrderError,
+    change_order_status,
+    mark_order_paid,
+)
 
 logger = logging.getLogger(__name__)
 NO_STORE = {"Cache-Control": "no-store"}
@@ -18,6 +24,17 @@ router = APIRouter(
     tags=["staff"],
     dependencies=[Depends(require_staff)],
 )
+
+
+def action_error(error: StaffOrderError) -> HTTPException:
+    return HTTPException(
+        status_code=404 if error.code == "order_not_found" else 409,
+        detail={
+            "code": error.code,
+            "message": error.message,
+        },
+        headers=NO_STORE,
+    )
 
 
 async def staff_orders(
@@ -90,6 +107,61 @@ async def order_details(
             "Order not found",
             headers=NO_STORE,
         )
+
+    response.headers.update(NO_STORE)
+    return order
+
+
+@router.patch(
+    "/orders/{order_id}/status",
+    response_model=OrderResponse,
+)
+async def update_order_status(
+    order_id: UUID,
+    change: StaffOrderStatusChange,
+    response: Response,
+    staff: Annotated[StaffIdentity, Depends(require_staff)],
+    repository: Annotated[
+        StaffOrderRepository,
+        Depends(staff_orders, scope="function"),
+    ],
+) -> OrderResponse:
+    try:
+        order = await change_order_status(
+            repository.connection,
+            order_id=order_id,
+            # Trust the verified Firebase identity, not a browser-supplied UID.
+            staff_user_id=staff.user_id,
+            change=change,
+        )
+    except StaffOrderError as error:
+        raise action_error(error) from error
+
+    response.headers.update(NO_STORE)
+    return order
+
+
+@router.post(
+    "/orders/{order_id}/paid",
+    response_model=OrderResponse,
+)
+async def record_order_payment(
+    order_id: UUID,
+    response: Response,
+    staff: Annotated[StaffIdentity, Depends(require_staff)],
+    repository: Annotated[
+        StaffOrderRepository,
+        Depends(staff_orders, scope="function"),
+    ],
+) -> OrderResponse:
+    try:
+        order = await mark_order_paid(
+            repository.connection,
+            order_id=order_id,
+            staff_user_id=staff.user_id,
+        )
+    except StaffOrderError as error:
+        raise action_error(error) from error
 
     response.headers.update(NO_STORE)
     return order
