@@ -22,6 +22,10 @@ from app.repositories.menu_admin import MenuAdminRepository
 from app.repositories.order import OrderRepository
 from app.repositories.quote import QuoteRepository
 from app.repositories.restaurant_config import RestaurantConfigurationRepository
+from app.repositories.simulator import (
+    SimulatorConfigurationError,
+    SimulatorRepository,
+)
 from app.repositories.staff_orders import StaffOrderRepository
 from app.schemas.cart import AddCartItemRequest, UpdateCartItemRequest
 from app.schemas.order import CheckoutNeedsReview, OrderResponse
@@ -4883,5 +4887,56 @@ def test_tool_dispatcher_checkout_and_confirmation(database_settings):
                         )
                         == 1
                     )
+
+    asyncio.run(scenario())
+
+def test_simulator_creates_separate_customer_cart_contexts(database_settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            repository = SimulatorRepository(connection)
+
+            # The default simulator path insists on restaurant_dev.
+            with pytest.raises(SimulatorConfigurationError):
+                await repository.create_context()
+
+            assert (
+                await connection.fetchval("SELECT count(*) FROM public.customers") == 0
+            )
+
+            first = await repository.create_context(expected_database="restaurant_test")
+            second = await repository.create_context(
+                expected_database="restaurant_test"
+            )
+            assert first[0] != second[0] and first[1] != second[1]
+
+            for customer_id, cart_id in (first, second):
+                row = await connection.fetchrow(
+                    "SELECT customer_id, status, version FROM public.carts WHERE id=$1",
+                    cart_id,
+                )
+                assert row["customer_id"] == customer_id
+                assert row["status"] == "BUILDING"
+                assert row["version"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_simulator_failed_cart_insert_rolls_back_customer(database_settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            # This test-only constraint disappears when isolated_data rolls back.
+            await connection.execute(
+                "ALTER TABLE public.carts ADD CONSTRAINT simulator_test_reject CHECK (false)"
+            )
+
+            with pytest.raises(asyncpg.CheckViolationError):
+                await SimulatorRepository(connection).create_context(
+                    expected_database="restaurant_test"
+                )
+
+            assert (
+                await connection.fetchval("SELECT count(*) FROM public.customers") == 0
+            )
+            assert await connection.fetchval("SELECT count(*) FROM public.carts") == 0
 
     asyncio.run(scenario())
