@@ -12,6 +12,7 @@ from app.schemas.order import CheckoutNeedsReview, OrderResponse
 from app.schemas.quote import QuoteResponse
 from app.schemas.restaurant_config import RestaurantConfiguration
 from app.services.cart import CartError, get_cart
+from app.services.intake import INTAKE_MESSAGES, intake_block_reason
 from app.services.opening_hours import is_open_now
 from app.services.quote import (
     QuoteError,
@@ -56,23 +57,11 @@ def validate_quote_for_placement(
             "This cart cannot be placed.",
         )
 
-    if not config.ordering_enabled:
-        raise QuoteError(
-            "ordering_paused",
-            "The restaurant is not accepting orders.",
-        )
-
-    if config.tax_rate_bps is None:
-        raise QuoteError(
-            "tax_not_configured",
-            "The tax rate is not configured.",
-        )
-
-    if not is_open_now(config, now):
-        raise QuoteError(
-            "restaurant_closed",
-            "The restaurant is closed.",
-        )
+    # The async caller supplies database time.
+    # Recheck current intake conditions whenever an offer is built or placed.
+    reason = intake_block_reason(config, now)
+    if reason is not None:
+        raise QuoteError(reason, INTAKE_MESSAGES[reason])
 
     if cart.subtotal_cents is None or any(line.issue for line in cart.items):
         raise QuoteError(

@@ -16,6 +16,7 @@ from pydantic import SecretStr
 from app.config import Settings
 from app.main import create_app
 from app.repositories.cart import CartRepository
+from app.repositories.kitchen import KitchenRepository
 from app.repositories.menu import MenuRepository
 from app.repositories.menu_admin import MenuAdminRepository
 from app.repositories.order import OrderRepository
@@ -34,6 +35,7 @@ from app.services.cart import (
     remove_cart_item,
     update_cart_item,
 )
+from app.services.intake import intake_block_reason, kitchen_is_online
 from app.services.menu_selection import SelectionError, validate_selection
 from app.services.order import OrderError, get_order, place_order
 from app.services.quote import (
@@ -1980,7 +1982,8 @@ async def committed_cart_data(
                             UPDATE public.restaurant_settings
                             SET ordering_enabled=true,
                                 tax_rate_bps=1000,
-                                preparation_minutes=20
+                                preparation_minutes=20,
+                                kitchen_last_seen_at = clock_timestamp()
                             WHERE id=1
                             """
                         )
@@ -2328,9 +2331,12 @@ async def prepare_quote_cart(connection: asyncpg.Connection):
 
     await connection.execute(
         """
-        UPDATE public.restaurant_settings
-        SET tax_rate_bps=1000, ordering_enabled=true, preparation_minutes=20
-        WHERE id=1
+         UPDATE public.restaurant_settings
+         SET tax_rate_bps = 1000,
+            ordering_enabled = true,
+            preparation_minutes = 20,
+            kitchen_last_seen_at = clock_timestamp()
+         WHERE id = 1
         """
     )
     await connection.execute(
@@ -2975,6 +2981,9 @@ def test_confirmation_waits_for_cart_edit(database_settings: Settings):
                                     )
                                     for day in range(7)
                                 ],
+                                kitchen_last_seen_at=await first.fetchval(
+                                    "SELECT clock_timestamp()"
+                                ),
                             ),
                             await first.fetchval("SELECT clock_timestamp()"),
                         )
@@ -4414,6 +4423,319 @@ def test_staff_concurrent_actions(
                         assert event_count == 2
                     finally:
                         # Settle the task before releasing its connection.
+                        await settle_test_task(pending)
+
+    asyncio.run(scenario())
+
+def test_kitchen_heartbeat_preserves_manual_pause(database_settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            kitchen = KitchenRepository(connection)
+            assert await kitchen.heartbeat() is False
+
+            await prepare_quote_cart(connection)
+            await kitchen.set_ordering_enabled(False)
+            await kitchen.heartbeat()
+
+            config = await RestaurantConfigurationRepository(connection).get()
+            now = await connection.fetchval("SELECT clock_timestamp()")
+
+            assert config is not None
+            assert config.ordering_enabled is False
+            assert kitchen_is_online(config, now)
+            assert intake_block_reason(config, now) == "ordering_paused"
+
+            await kitchen.set_ordering_enabled(True)
+            config = await RestaurantConfigurationRepository(connection).get()
+            assert intake_block_reason(config, now) is None
+
+            # Advance heartbeat age without waiting 31 real seconds.
+            await connection.execute(
+                """
+                UPDATE public.restaurant_settings
+                SET kitchen_last_seen_at =
+                    clock_timestamp() - interval '31 seconds'
+                WHERE id = 1
+                """
+            )
+            config = await RestaurantConfigurationRepository(connection).get()
+            now = await connection.fetchval("SELECT clock_timestamp()")
+
+            assert config.ordering_enabled is True
+            assert intake_block_reason(config, now) == "kitchen_offline"
+
+    asyncio.run(scenario())
+
+
+def test_kitchen_offline_blocks_checkout_and_saved_order_retries_work(
+    database_settings,
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, _, _, quote = await prepare_pending_quote(connection)
+            await confirm_test_quote(connection, context, quote)
+
+            await connection.execute(
+                """
+                UPDATE public.restaurant_settings
+                SET kitchen_last_seen_at = NULL
+                WHERE id = 1
+                """
+            )
+
+            result = await place_order(
+                connection, **context, quote_id=quote.quote_id
+            )
+            assert isinstance(result, CheckoutNeedsReview)
+            assert result.code == "kitchen_offline"
+            assert await connection.fetchval(
+                "SELECT count(*) FROM public.orders"
+            ) == 0
+
+            assert await connection.fetchval(
+                "SELECT is_pending FROM public.quotes WHERE id=$1",
+                quote.quote_id,
+            ) is False
+
+            # After reconnecting, obtain and confirm a new quote.
+            await KitchenRepository(connection).heartbeat()
+            replacement = await create_quote(
+                connection, **context, expected_version=1
+            )
+            await confirm_test_quote(connection, context, replacement)
+
+            saved = await place_order(
+                connection,
+                **context,
+                quote_id=replacement.quote_id,
+            )
+            assert isinstance(saved, OrderResponse)
+
+            await connection.execute(
+                """
+                UPDATE public.restaurant_settings
+                SET ordering_enabled=false, kitchen_last_seen_at=NULL
+                WHERE id=1
+                """
+            )
+
+            # Recovering a committed order must still work while offline.
+            assert await place_order(
+                connection,
+                **context,
+                quote_id=replacement.quote_id,
+            ) == saved
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["item", "option"])
+def test_kitchen_availability_blocks_new_quotes_but_preserves_saved_orders(
+    database_settings, kind
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            context, item_id, option_id, quote = (
+                await prepare_pending_quote(connection)
+            )
+            await confirm_test_quote(connection, context, quote)
+            admin = MenuAdminRepository(connection)
+
+            async def available(value):
+                if kind == "item":
+                    return await admin.update_item(item_id, None, value)
+                return await admin.update_option(option_id, None, value)
+
+            assert await available(False)
+
+            with pytest.raises(QuoteError) as error:
+                await create_quote(connection, **context, expected_version=1)
+            assert error.value.code == "invalid_cart"
+
+            result = await place_order(
+                connection, **context, quote_id=quote.quote_id
+            )
+            assert isinstance(result, CheckoutNeedsReview)
+            assert result.code == "invalid_cart"
+
+            assert await available(True)
+            replacement = await create_quote(
+                connection, **context, expected_version=1
+            )
+            await confirm_test_quote(connection, context, replacement)
+
+            saved = await place_order(
+                connection,
+                **context,
+                quote_id=replacement.quote_id,
+            )
+            assert isinstance(saved, OrderResponse)
+
+            assert await available(False)
+
+            # Changing today's menu must not change an existing order.
+            restored = await OrderRepository(connection).get(
+                saved.order_id, context["customer_id"]
+            )
+            assert restored == saved
+
+            assert await connection.fetchval(
+                "SELECT price_cents FROM public.menu_items WHERE id=$1",
+                item_id,
+            ) == 1399
+
+            assert await connection.fetchval(
+                """
+                SELECT price_delta_cents
+                FROM public.modifier_options
+                WHERE id=$1
+                """,
+                option_id,
+            ) == 300
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "change,code",
+    [
+        ("pause", "ordering_paused"),
+        ("offline", "kitchen_offline"),
+        ("item", "invalid_cart"),
+        ("option", "invalid_cart"),
+    ],
+)
+def test_kitchen_change_is_checked_after_checkout_waits(
+    database_settings, change, code
+):
+    async def scenario():
+        async with confirmed_checkout_data(database_settings) as d:
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    pending = None
+
+                    try:
+                        async with first.transaction():
+                            if change == "pause":
+                                await KitchenRepository(
+                                    first
+                                ).set_ordering_enabled(False)
+                            elif change == "offline":
+                                await first.execute(
+                                    """
+                                    UPDATE public.restaurant_settings
+                                    SET kitchen_last_seen_at =
+                                        clock_timestamp() - interval '31 seconds'
+                                    WHERE id=1
+                                    """
+                                )
+                            elif change == "item":
+                                await MenuAdminRepository(first).update_item(
+                                    d.item_id, None, False
+                                )
+                            else:
+                                await MenuAdminRepository(first).update_option(
+                                    d.regular_id, None, False
+                                )
+
+                            pending = asyncio.create_task(
+                                place_order(second, **d.target)
+                            )
+
+                            # Verify actual database blocking rather than sleeping.
+                            await wait_for_database_block(first, second, pending)
+
+                        result = await asyncio.wait_for(pending, 5)
+                        assert isinstance(result, CheckoutNeedsReview)
+                        assert result.code == code
+
+                        assert await first.fetchval(
+                            "SELECT count(*) FROM public.orders WHERE cart_id=$1",
+                            d.cart_id,
+                        ) == 0
+                    finally:
+                        await settle_test_task(pending)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["pause", "item"])
+def test_kitchen_change_waits_for_successful_checkout(
+    database_settings, change
+):
+    async def scenario():
+        async with confirmed_checkout_data(database_settings) as d:
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    pending = None
+
+                    try:
+                        async with first.transaction():
+                            saved = await place_order(first, **d.target)
+                            assert isinstance(saved, OrderResponse)
+
+                            if change == "pause":
+                                operation = KitchenRepository(
+                                    second
+                                ).set_ordering_enabled(False)
+                            else:
+                                operation = MenuAdminRepository(
+                                    second
+                                ).update_item(d.item_id, None, False)
+
+                            pending = asyncio.create_task(operation)
+                            await wait_for_database_block(first, second, pending)
+
+                        assert await asyncio.wait_for(pending, 5) is True
+
+                        assert await OrderRepository(first).get(
+                            saved.order_id, d.customer_id
+                        ) == saved
+                    finally:
+                        await settle_test_task(pending)
+
+    asyncio.run(scenario())
+
+
+def test_kitchen_heartbeat_cannot_overwrite_a_concurrent_pause(
+    database_settings,
+):
+    async def scenario():
+        async with confirmed_checkout_data(database_settings):
+            async with database_app(database_settings) as app:
+                async with (
+                    app.state.db_pool.acquire(timeout=5) as first,
+                    app.state.db_pool.acquire(timeout=5) as second,
+                ):
+                    pending = None
+
+                    try:
+                        async with first.transaction():
+                            await KitchenRepository(
+                                first
+                            ).set_ordering_enabled(False)
+
+                            pending = asyncio.create_task(
+                                KitchenRepository(second).heartbeat()
+                            )
+                            await wait_for_database_block(first, second, pending)
+
+                        assert await asyncio.wait_for(pending, 5) is True
+
+                        config = await RestaurantConfigurationRepository(
+                            first
+                        ).get()
+                        now = await first.fetchval("SELECT clock_timestamp()")
+
+                        assert config.ordering_enabled is False
+                        assert kitchen_is_online(config, now)
+                    finally:
                         await settle_test_task(pending)
 
     asyncio.run(scenario())

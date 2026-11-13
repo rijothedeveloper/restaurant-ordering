@@ -145,17 +145,19 @@ async function staffRequest<T>(
       );
     }
 
-    if (response.status === 404) {
-      throw new StaffApiError(404, "Order not found.");
-    }
-
-    if (response.status === 409) {
+        if ([404, 409].includes(response.status)) {
       const data = await response.json().catch(() => null);
-      const message = data?.detail?.message;
+      const detail = data?.detail;
+
+      // Support both a plain HTTPException message and our structured errors.
+      const message =
+        typeof detail === "string" ? detail : detail?.message;
 
       throw new StaffApiError(
-        409,
-        typeof message === "string" ? message : "Order changed.",
+        response.status,
+        typeof message === "string"
+          ? message
+          : "The requested action is unavailable.",
       );
     }
 
@@ -221,8 +223,10 @@ export function staffWrite<T>(
   path: string,
   method: "POST" | "PATCH",
   body?: unknown,
+  signal?: AbortSignal,
 ) {
-  return staffRequest<T>(path, { method, body });
+  // Allow an outstanding heartbeat to be cancelled when the page is hidden.
+  return staffRequest<T>(path, { method, body, signal });
 }
 
 export function getStaffIdentity(

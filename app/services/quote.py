@@ -16,6 +16,7 @@ from app.schemas.quote import (
 )
 from app.schemas.restaurant_config import RestaurantConfiguration
 from app.services.cart import CartError, get_cart
+from app.services.intake import INTAKE_MESSAGES, intake_block_reason
 from app.services.opening_hours import is_open_now
 
 QUOTE_TTL_MINUTES = 2
@@ -58,16 +59,11 @@ def build_quote(
             "invalid_cart", "Correct unavailable or invalid cart selections."
         )
 
-    if not config.ordering_enabled:
-        raise QuoteError("ordering_paused", "The restaurant is not accepting orders.")
-
-    if config.tax_rate_bps is None:
-        raise QuoteError(
-            "tax_not_configured", "The restaurant tax rate is not configured."
-        )
-
-    if not is_open_now(config, now):
-        raise QuoteError("restaurant_closed", "The restaurant is closed.")
+    # The async caller supplies database time.
+    # Recheck current intake conditions whenever an offer is built or placed.
+    reason = intake_block_reason(config, now)
+    if reason is not None:
+        raise QuoteError(reason, INTAKE_MESSAGES[reason])
 
     expires_at = now + timedelta(minutes=QUOTE_TTL_MINUTES)
     pickup_at = expires_at + timedelta(minutes=config.preparation_minutes)

@@ -27,10 +27,7 @@ NOW = datetime(2026, 7, 6, 18, tzinfo=UTC)  # Monday, 11:00 in Los Angeles
 
 def sample_cart() -> CartResponse:
     option = ModifierOption(
-        id=uuid4(),
-        name="Large",
-        price_delta_cents=300,
-        is_available=True,
+        id=uuid4(), name="Large", price_delta_cents=300, is_available=True
     )
     line = CartLine(
         line_id=uuid4(),
@@ -43,11 +40,7 @@ def sample_cart() -> CartResponse:
         line_total_cents=3398,
     )
     return CartResponse(
-        cart_id=uuid4(),
-        version=4,
-        status="BUILDING",
-        items=[line],
-        subtotal_cents=3398,
+        cart_id=uuid4(), version=4, status="BUILDING", items=[line], subtotal_cents=3398
     )
 
 
@@ -55,6 +48,8 @@ def sample_config() -> RestaurantConfiguration:
     return RestaurantConfiguration(
         restaurant_name="Test Kitchen",
         ordering_enabled=True,
+        # Ordinary quote tests start with a connected kitchen.
+        kitchen_last_seen_at=NOW,
         preparation_minutes=20,
         tax_rate_bps=1000,
         hours=[OpeningPeriod(weekday=0, opens_minute=660, closes_minute=1260)],
@@ -81,8 +76,7 @@ def test_quote_copies_lines_and_calculates_times() -> None:
     cart = sample_cart()
     quote = build_quote(cart, sample_config(), NOW)
 
-    assert quote.cart_id == cart.cart_id
-    assert quote.cart_version == 4
+    assert quote.cart_id == cart.cart_id and quote.cart_version == 4
     assert (quote.subtotal_cents, quote.tax_cents, quote.total_cents) == (
         3398,
         340,
@@ -92,6 +86,7 @@ def test_quote_copies_lines_and_calculates_times() -> None:
     assert quote.expires_at == NOW + timedelta(minutes=2)
     assert quote.pickup_at == NOW + timedelta(minutes=22)
 
+    # The quote keeps its own snapshot when the cart changes later.
     cart.items[0].options[0].name = "New name"
     assert quote.items[0].options[0].name == "Large"
 
@@ -151,6 +146,9 @@ def test_pickup_uses_elapsed_time_through_dst_fallback() -> None:
     config.hours = [OpeningPeriod(weekday=6, opens_minute=60, closes_minute=120)]
     now = datetime(2026, 11, 1, 8, 50, tzinfo=UTC)
 
+    # Match the heartbeat to this test's November clock.
+    config.kitchen_last_seen_at = now
+
     quote = build_quote(sample_cart(), config, now)
 
     assert quote.pickup_at == datetime(2026, 11, 1, 9, 12, tzinfo=UTC)
@@ -168,10 +166,7 @@ def test_quote_creation_requires_valid_expected_version(bad: object) -> None:
     with pytest.raises(CartError) as error:
         asyncio.run(
             create_quote(
-                connection,
-                cart_id=uuid4(),
-                customer_id=uuid4(),
-                expected_version=bad,
+                connection, cart_id=uuid4(), customer_id=uuid4(), expected_version=bad
             )
         )
 
@@ -188,14 +183,14 @@ def test_quote_creation_requires_valid_expected_version(bad: object) -> None:
         (-1, 5, "quote_stale"),
     ],
 )
-def test_quote_read_checks_expiry_and_version(monkeypatch, offset, version, code):
+def test_quote_read_checks_expiry_and_version(
+    monkeypatch, offset, version, code
+) -> None:
     quote = build_quote(sample_cart(), sample_config(), NOW)
     checked_at = quote.expires_at + timedelta(microseconds=offset)
 
     monkeypatch.setattr(
-        QuoteRepository,
-        "get",
-        AsyncMock(return_value=(quote, version, checked_at)),
+        QuoteRepository, "get", AsyncMock(return_value=(quote, version, checked_at))
     )
 
     operation = get_quote(
@@ -225,15 +220,9 @@ def test_confirmation_expiry_boundary(monkeypatch, offset):
     connection.fetchval = AsyncMock(return_value=checked_at)
 
     monkeypatch.setattr(
-        CartRepository,
-        "get_status_for_update",
-        AsyncMock(return_value="BUILDING"),
+        CartRepository, "get_status_for_update", AsyncMock(return_value="BUILDING")
     )
-    monkeypatch.setattr(
-        CartRepository,
-        "get_version",
-        AsyncMock(return_value=4),
-    )
+    monkeypatch.setattr(CartRepository, "get_version", AsyncMock(return_value=4))
     monkeypatch.setattr(
         QuoteRepository,
         "get_confirmation_state_for_update",
@@ -266,7 +255,6 @@ def test_confirmation_expiry_boundary(monkeypatch, offset):
     else:
         with pytest.raises(QuoteError) as error:
             asyncio.run(operation)
-
         assert error.value.code == "quote_expired"
         write.assert_not_awaited()
 
@@ -275,13 +263,12 @@ def test_confirmation_expiry_boundary(monkeypatch, offset):
 def test_placement_preserves_promised_pickup(seconds):
     cart, config = sample_cart(), sample_config()
     quote = build_quote(cart, config, NOW)
+    placed_at = NOW + timedelta(seconds=seconds)
 
-    validate_quote_for_placement(
-        quote,
-        cart,
-        config,
-        NOW + timedelta(seconds=seconds),
-    )
+    # Simulate the kitchen remaining connected while the customer confirms.
+    config.kitchen_last_seen_at = placed_at
+
+    validate_quote_for_placement(quote, cart, config, placed_at)
 
     assert quote.pickup_at == NOW + timedelta(minutes=22)
 
@@ -293,10 +280,7 @@ def test_placement_rejects_expiry_boundary(offset):
 
     with pytest.raises(QuoteError) as error:
         validate_quote_for_placement(
-            quote,
-            cart,
-            config,
-            quote.expires_at + timedelta(microseconds=offset),
+            quote, cart, config, quote.expires_at + timedelta(microseconds=offset)
         )
 
     assert error.value.code == "quote_expired"
@@ -326,7 +310,7 @@ def test_placement_detects_changed_offer(change):
     elif change == "option_name":
         line.options[0].name = "XL"
     elif change == "option_breakdown":
-        # Modifier prices matter even if the final total is unchanged.
+        # A different modifier price still matters when the total is unchanged.
         line.options[0].price_delta_cents += 100
     elif change == "tax":
         config.tax_rate_bps = 500
@@ -368,8 +352,7 @@ def test_placement_checks_current_conditions(case, code):
         config.hours = []
     elif case == "invalid":
         cart.items[0].issue = CartLineIssue(
-            code="option_unavailable",
-            message="Unavailable",
+            code="option_unavailable", message="Unavailable"
         )
         cart.subtotal_cents = None
     elif case == "version":
@@ -387,44 +370,27 @@ def test_placement_checks_current_conditions(case, code):
 
 def test_placement_can_honor_pickup_when_a_new_quote_would_close_too_late():
     cart, config = sample_cart(), sample_config()
-    config.hours = [
-        OpeningPeriod(
-            weekday=0,
-            opens_minute=660,
-            closes_minute=683,
-        )
-    ]
+    config.hours = [OpeningPeriod(weekday=0, opens_minute=660, closes_minute=683)]
     quote = build_quote(cart, config, NOW)
-    later = NOW + timedelta(seconds=90)
 
-    # The existing pickup promise still fits.
+    later = NOW + timedelta(seconds=90)
+    config.kitchen_last_seen_at = later
+
     validate_quote_for_placement(quote, cart, config, later)
 
-    # A new two-minute confirmation window would push pickup too late.
     with pytest.raises(QuoteError) as error:
         build_quote(cart, config, later)
 
     assert error.value.code == "pickup_unavailable"
 
 
-@pytest.mark.parametrize(
-    "periods",
-    [
-        [(660, 682)],
-        [(660, 665), (680, 720)],
-    ],
-)
+@pytest.mark.parametrize("periods", [[(660, 682)], [(660, 665), (680, 720)]])
 def test_placement_detects_changed_closing_or_break(periods):
     cart, config = sample_cart(), sample_config()
     quote = build_quote(cart, config, NOW)
 
     config.hours = [
-        OpeningPeriod(
-            weekday=0,
-            opens_minute=start,
-            closes_minute=end,
-        )
-        for start, end in periods
+        OpeningPeriod(weekday=0, opens_minute=a, closes_minute=b) for a, b in periods
     ]
 
     with pytest.raises(QuoteError) as error:
@@ -440,33 +406,29 @@ def test_placement_preparation_time_boundary(offset):
     config.preparation_minutes = 21
     now = NOW + timedelta(minutes=1, microseconds=offset)
 
+    # Isolate preparation-time validation from heartbeat expiry.
+    config.kitchen_last_seen_at = now
+
     if offset == 0:
         validate_quote_for_placement(quote, cart, config, now)
     else:
         with pytest.raises(QuoteError) as error:
             validate_quote_for_placement(quote, cart, config, now)
-
         assert error.value.code == "quote_changed"
 
 
 def test_placement_uses_elapsed_time_across_dst_fallback():
     cart, config = sample_cart(), sample_config()
-    config.hours = [
-        OpeningPeriod(
-            weekday=6,
-            opens_minute=60,
-            closes_minute=120,
-        )
-    ]
+    config.hours = [OpeningPeriod(weekday=6, opens_minute=60, closes_minute=120)]
     now = datetime(2026, 11, 1, 8, 50, tzinfo=UTC)
+
+    config.kitchen_last_seen_at = now
     quote = build_quote(cart, config, now)
 
-    validate_quote_for_placement(
-        quote,
-        cart,
-        config,
-        now + timedelta(minutes=1),
-    )
+    placed_at = now + timedelta(minutes=1)
+    config.kitchen_last_seen_at = placed_at
+
+    validate_quote_for_placement(quote, cart, config, placed_at)
 
     assert quote.pickup_at == datetime(2026, 11, 1, 9, 12, tzinfo=UTC)
 
@@ -476,25 +438,39 @@ def test_placement_requires_aware_time():
     quote = build_quote(cart, config, NOW)
 
     with pytest.raises(ValueError, match="timezone-aware"):
-        validate_quote_for_placement(
-            quote,
-            cart,
-            config,
-            NOW.replace(tzinfo=None),
-        )
+        validate_quote_for_placement(quote, cart, config, NOW.replace(tzinfo=None))
 
 
 def test_placement_ignores_line_display_order():
     cart, config = sample_cart(), sample_config()
-    cart.items.append(
-        cart.items[0].model_copy(
-            deep=True,
-            update={"line_id": uuid4()},
-        )
-    )
+    cart.items.append(cart.items[0].model_copy(deep=True, update={"line_id": uuid4()}))
     cart.subtotal_cents *= 2
     quote = build_quote(cart, config, NOW)
 
     cart.items.reverse()
 
     validate_quote_for_placement(quote, cart, config, NOW)
+
+
+@pytest.mark.parametrize("age", [None, 30, 31])
+def test_quote_and_placement_reject_offline_kitchen(age: int | None) -> None:
+    cart, config = sample_cart(), sample_config()
+
+    # Create the original quote while the kitchen is connected.
+    quote = build_quote(cart, config, NOW)
+
+    # No heartbeat, exactly 30 seconds old, and older are all offline.
+    config.kitchen_last_seen_at = (
+        None if age is None else NOW - timedelta(seconds=age)
+    )
+
+    with pytest.raises(QuoteError) as quote_error:
+        build_quote(cart, config, NOW)
+
+    assert quote_error.value.code == "kitchen_offline"
+
+    # An existing quote also requires a connected kitchen at placement.
+    with pytest.raises(QuoteError) as placement_error:
+        validate_quote_for_placement(quote, cart, config, NOW)
+
+    assert placement_error.value.code == "kitchen_offline"

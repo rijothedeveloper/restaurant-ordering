@@ -16,6 +16,8 @@ import {
   type OrderSummary,
 } from "@/lib/orders";
 import { OrderActions } from "@/components/order-actions";
+import { KitchenControls } from "@/components/kitchen-controls";
+import { useKitchenHeartbeat } from "@/hooks/use-kitchen-heartbeat";
 
 function beep(context: AudioContext) {
   if (context.state !== "running") return;
@@ -63,8 +65,15 @@ export default function Kitchen({
     [],
   );
 
+  const reportQueueRead = useKitchenHeartbeat(
+  !denied && !signingOut,
+  denyAccess,
+);
+
   const receiveOrders = useCallback(
     (orders: OrderSummary[]) => {
+      // A successful queue read proves this screen can receive orders.
+      reportQueueRead();
       const previous = seen.current;
 
       const added = previous
@@ -96,7 +105,7 @@ export default function Kitchen({
         }
       }
     },
-    [],
+    [reportQueueRead],
   );
 
   const refreshOrders = useCallback(() => {
@@ -270,6 +279,12 @@ export default function Kitchen({
               ? `${newCount} new order${newCount === 1 ? "" : "s"}. Select an order to clear its alert.`
               : "No new order alerts."}
           </p>
+
+          <KitchenControls
+            now={now}
+            disabled={signingOut}
+            onAuthError={denyAccess}
+          />
 
           <div className="kitchen-grid">
             <section

@@ -1,6 +1,9 @@
 import asyncpg
 
-from app.schemas.restaurant_config import OpeningPeriod, RestaurantConfiguration
+from app.schemas.restaurant_config import (
+    OpeningPeriod,
+    RestaurantConfiguration,
+)
 
 
 class RestaurantConfigurationRepository:
@@ -10,23 +13,28 @@ class RestaurantConfigurationRepository:
     async def get(self) -> RestaurantConfiguration | None:
         rows = await self.connection.fetch(
             """
-            SELECT s.name, s.preparation_minutes, s.ordering_enabled, s.tax_rate_bps,
-                h.weekday, h.opens_minute, h.closes_minute
+            SELECT s.name, s.preparation_minutes,
+                   s.ordering_enabled, s.tax_rate_bps,
+                   s.kitchen_last_seen_at,
+                   h.weekday, h.opens_minute, h.closes_minute
             FROM public.restaurant_settings AS s
             LEFT JOIN public.opening_hours AS h ON true
             WHERE s.id = 1
             ORDER BY h.weekday, h.opens_minute
             """
         )
+
         if not rows:
             return None
 
         first = rows[0]
+
         return RestaurantConfiguration(
             restaurant_name=first["name"],
             preparation_minutes=first["preparation_minutes"],
-            tax_rate_bps=first["tax_rate_bps"],
             ordering_enabled=first["ordering_enabled"],
+            kitchen_last_seen_at=first["kitchen_last_seen_at"],
+            tax_rate_bps=first["tax_rate_bps"],
             hours=[
                 OpeningPeriod(
                     weekday=row["weekday"],

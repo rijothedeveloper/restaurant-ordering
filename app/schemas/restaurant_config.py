@@ -1,6 +1,6 @@
 from typing import Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 
 class OpeningPeriod(BaseModel):
@@ -19,6 +19,8 @@ class RestaurantConfiguration(BaseModel):
     restaurant_name: str
     preparation_minutes: int = Field(ge=1, le=180)
     ordering_enabled: bool
+    # Missing heartbeat means the kitchen is offline.
+    kitchen_last_seen_at: AwareDatetime | None = None
     tax_rate_bps: int | None = Field(default=None, ge=0, le=10000)
     hours: list[OpeningPeriod] = Field(default_factory=list)
 
