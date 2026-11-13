@@ -51,6 +51,7 @@ from app.services.staff_orders import (
     change_order_status,
     mark_order_paid,
 )
+from app.services.tools import ToolContext, ToolDispatcher
 
 pytestmark = pytest.mark.integration
 
@@ -4737,5 +4738,150 @@ def test_kitchen_heartbeat_cannot_overwrite_a_concurrent_pause(
                         assert kitchen_is_online(config, now)
                     finally:
                         await settle_test_task(pending)
+
+    asyncio.run(scenario())
+
+def test_tool_dispatcher_checkout_and_confirmation(database_settings):
+    async def scenario():
+        async with committed_cart_data(database_settings, checkout_ready=True) as d:
+            async with database_app(database_settings) as app:
+                context = ToolContext(customer_id=d.customer_id, cart_id=d.cart_id)
+                dispatcher = ToolDispatcher(app.state.db_pool, context)
+
+                async def call(name, **arguments):
+                    return await dispatcher.dispatch(name, json.dumps(arguments))
+
+                cart = await call("get_cart")
+                assert cart.ok and cart.data["version"] == 1
+
+                # Even a valid cart ID cannot be used with another customer.
+                other = ToolDispatcher(
+                    app.state.db_pool,
+                    ToolContext(customer_id=uuid4(), cart_id=d.cart_id),
+                )
+                denied = await other.dispatch("get_cart", "{}")
+                assert not denied.ok and denied.error.code == "cart_not_found"
+
+                stale = await call(
+                    "remove_cart_item", line_id=str(d.line_id), expected_version=0
+                )
+                assert not stale.ok and stale.error.code == "cart_version_conflict"
+
+                invalid = await call(
+                    "add_cart_item",
+                    item_id=str(d.item_id),
+                    quantity=1,
+                    option_ids=[],
+                    expected_version=1,
+                )
+                assert not invalid.ok and invalid.error.code == "too_few_options"
+                assert (await call("get_cart")).data["version"] == 1
+
+                added = await call(
+                    "add_cart_item",
+                    item_id=str(d.item_id),
+                    quantity=2,
+                    option_ids=[str(d.large_id)],
+                    expected_version=1,
+                )
+                assert added.ok and added.data["version"] == 2
+
+                removed = await call(
+                    "remove_cart_item",
+                    line_id=added.data["line_id"],
+                    expected_version=2,
+                )
+                assert removed.ok and removed.data["version"] == 3
+
+                changed = await call(
+                    "update_cart_item",
+                    line_id=str(d.line_id),
+                    quantity=2,
+                    option_ids=[str(d.regular_id)],
+                    expected_version=3,
+                )
+                assert changed.ok and changed.data["version"] == 4
+
+                quoted = await call("create_quote", expected_version=4)
+                assert quoted.ok
+                quote_id = quoted.data["quote_id"]
+
+                unconfirmed = await call("place_order", quote_id=quote_id)
+                assert not unconfirmed.ok
+                assert unconfirmed.error.code == "quote_not_confirmed"
+
+                async def confirm_from_trusted_adapter(quote_id):
+                    # Test-only simulation of completed readback and explicit yes.
+                    # Neither operation is exposed in the function allowlist.
+                    target = {
+                        "customer_id": d.customer_id,
+                        "cart_id": d.cart_id,
+                        "quote_id": UUID(quote_id),
+                    }
+
+                    async with app.state.db_pool.acquire(timeout=5) as connection:
+                        receipt = await complete_quote_readback(connection, **target)
+                        await confirm_quote(
+                            connection,
+                            **target,
+                            readback_token=receipt.readback_token,
+                            answer="yes",
+                        )
+
+                await confirm_from_trusted_adapter(quote_id)
+
+                async with app.state.db_pool.acquire(timeout=5) as connection:
+                    await connection.execute(
+                        "UPDATE public.restaurant_settings "
+                        "SET kitchen_last_seen_at=NULL WHERE id=1"
+                    )
+
+                offline = await call("place_order", quote_id=quote_id)
+                assert not offline.ok and offline.error.code == "kitchen_offline"
+
+                # Reconnection requires a fresh quote and confirmation after review.
+                async with app.state.db_pool.acquire(timeout=5) as connection:
+                    assert (
+                        await connection.fetchval(
+                            "SELECT count(*) FROM public.orders WHERE cart_id=$1",
+                            d.cart_id,
+                        )
+                        == 0
+                    )
+                    await connection.execute(
+                        "UPDATE public.restaurant_settings "
+                        "SET kitchen_last_seen_at=clock_timestamp() WHERE id=1"
+                    )
+
+                quoted = await call("create_quote", expected_version=4)
+                assert quoted.ok
+                quote_id = quoted.data["quote_id"]
+
+                await confirm_from_trusted_adapter(quote_id)
+                placed = await call("place_order", quote_id=quote_id)
+
+                assert placed.ok
+                assert placed.data["status"] == "PLACED"
+                assert placed.data["payment_status"] == "UNPAID"
+                assert placed.data["total_cents"] == 3078
+
+                async with app.state.db_pool.acquire(timeout=5) as connection:
+                    await connection.execute(
+                        "UPDATE public.restaurant_settings "
+                        "SET ordering_enabled=false, kitchen_last_seen_at=NULL WHERE id=1"
+                    )
+
+                # Retry recovers the committed order even after intake stops.
+                repeated = await call("place_order", quote_id=quote_id)
+                assert repeated == placed
+
+                async with app.state.db_pool.acquire(timeout=5) as connection:
+                    assert (
+                        await connection.fetchval(
+                            "SELECT count(*) FROM public.orders WHERE cart_id=$1",
+                            d.cart_id,
+                        )
+                        == 1
+                    )
 
     asyncio.run(scenario())
