@@ -10,12 +10,14 @@ import asyncpg
 from pydantic import ValidationError
 
 from app.config import Settings, get_settings
-from app.repositories.simulator import (
-    SimulatorConfigurationError,
-    SimulatorRepository,
-)
+from app.repositories.simulator import SimulatorConfigurationError, SimulatorRepository
 from app.schemas.tools import ToolResult
-from app.services.simulator import TextSimulator
+from app.services.simulator import (
+    CommandError,
+    ExecutionResult,
+    PreparedCommand,
+    TextSimulator,
+)
 
 RESTAURANT_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
@@ -30,6 +32,8 @@ HELP = """Commands:
   review                     Read back the current pending quote
   yes                        Confirm the readback and place the order
   no                         Reject the pending quote
+  retry                      Resubmit the last prepared request with its same ID
+  replay EXECUTION_UUID       Read a saved result without executing anything
   staff REASON | help | quit
 
 Read cart before editing, including after resume or a version conflict.
@@ -147,10 +151,17 @@ def display_result(
     runner: asyncio.Runner,
     result: ToolResult,
 ) -> None:
+    if isinstance(result, ExecutionResult) and result.replayed:
+        print(result.model_dump_json(indent=2))
+        print(
+            "Saved result. Use status/cart for current state; review before confirming."
+        )
+        return
+
     if result.ok and result.data.get("kind") == "quote":
         quote = result.data["quote"]
 
-        # A failed print must never count as a completed readback.
+        # Only a freshly returned quote can start a new readback.
         print(format_quote(quote), flush=True)
 
         receipt = runner.run(simulator.readback_completed(UUID(quote["quote_id"])))
@@ -177,9 +188,11 @@ def console(
         runner.run(simulator.execute("status")),
     )
 
+    last_request: PreparedCommand | None = None
+
     while not simulator.stopped:
         try:
-            # No database transaction is held while waiting for input.
+            # Database transactions finish before we wait for input.
             text = input("restaurant> ").strip()
         except EOFError:
             break
@@ -192,11 +205,47 @@ def console(
             print(HELP)
             continue
 
-        display_result(
-            simulator,
-            runner,
-            runner.run(simulator.execute(text)),
-        )
+        if text.casefold() == "retry":
+            if last_request is None:
+                print("No prepared request in this run. Use replay EXECUTION_UUID.")
+                continue
+
+            print(
+                f"Execution: {last_request.execution_id}",
+                flush=True,
+            )
+            result = runner.run(simulator.submit(last_request))
+
+        elif text.split()[0].casefold() == "replay":
+            parts = text.split()
+
+            try:
+                if len(parts) != 2:
+                    raise ValueError
+                execution_id = UUID(parts[1])
+            except ValueError:
+                print("Use replay followed by one complete execution UUID.")
+                continue
+
+            result = runner.run(simulator.replay(execution_id))
+
+        else:
+            try:
+                last_request = simulator.prepare(text)
+            except CommandError:
+                last_request = None
+
+                # execute() revokes readback after malformed/mixed commands.
+                result = runner.run(simulator.execute(text))
+            else:
+                # Print the ID before submitting, so it survives a lost response.
+                print(
+                    f"Execution: {last_request.execution_id}",
+                    flush=True,
+                )
+                result = runner.run(simulator.submit(last_request))
+
+        display_result(simulator, runner, result)
 
     print(
         "Simulator ended. Saved conversation, cart, and orders remain in the database."

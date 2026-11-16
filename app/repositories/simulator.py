@@ -5,6 +5,8 @@ from uuid import UUID
 
 import asyncpg
 
+from app.schemas.tools import ToolResult
+
 
 class SimulatorConfigurationError(ValueError):
     pass
@@ -17,6 +19,12 @@ class Conversation:
     cart_id: UUID
     draft: dict[str, Any] | None
     staff_reason: str | None
+
+
+@dataclass(frozen=True)
+class SavedExecution:
+    request_json: str
+    result: ToolResult
 
 
 class SimulatorRepository:
@@ -145,5 +153,62 @@ class SimulatorRepository:
     async def pending_quote_id(self, cart_id: UUID) -> UUID | None:
         return await self.connection.fetchval(
             "SELECT id FROM public.quotes WHERE cart_id=$1 AND is_pending",
+            cart_id,
+        )
+
+    async def get_execution(
+        self,
+        session_id: UUID,
+        execution_id: UUID,
+    ) -> SavedExecution | None:
+        row = await self.connection.fetchrow(
+            """
+            SELECT request_json, result_json
+            FROM public.tool_executions
+            WHERE conversation_id=$1 AND execution_id=$2
+            """,
+            session_id,
+            execution_id,
+        )
+        if row is None:
+            return None
+
+        return SavedExecution(
+            request_json=row["request_json"],
+            result=ToolResult.model_validate_json(row["result_json"]),
+        )
+
+    async def save_execution(
+        self,
+        session_id: UUID,
+        execution_id: UUID,
+        request_json: str,
+        result: ToolResult,
+    ) -> None:
+        # The caller holds the conversation lock and operation's transaction.
+        # Insert completed results; no committed "in progress" row is needed.
+        await self.connection.execute(
+            """
+            INSERT INTO public.tool_executions
+                (conversation_id, execution_id, request_json, result_json)
+            VALUES ($1, $2, $3, $4::jsonb)
+            """,
+            session_id,
+            execution_id,
+            request_json,
+            result.model_dump_json(),
+        )
+
+    async def clear_readback(self, cart_id: UUID) -> None:
+        # Revoke receipts captured by an earlier prepared confirmation request.
+        # The quote remains available for a fresh review.
+        await self.connection.execute(
+            """
+            UPDATE public.quotes
+            SET readback_token=NULL,
+                readback_completed_at=NULL,
+                confirmed_at=NULL
+            WHERE cart_id=$1 AND is_pending
+            """,
             cart_id,
         )

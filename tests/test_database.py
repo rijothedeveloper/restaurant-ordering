@@ -3,6 +3,7 @@ import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -32,6 +33,7 @@ from app.schemas.order import CheckoutNeedsReview, OrderResponse
 from app.schemas.restaurant_config import OpeningPeriod, RestaurantConfiguration
 from app.schemas.selection import SelectionRequest
 from app.schemas.staff_order import StaffOrderStatusChange
+from app.schemas.tools import ToolResult
 from app.services.cart import (
     CartError,
     add_cart_item,
@@ -5187,5 +5189,315 @@ def test_simulator_rolls_back_confirmation_if_placement_fails(
                     )
             finally:
                 await pool.close()
+
+    asyncio.run(scenario())
+
+
+@asynccontextmanager
+async def simulator_session(settings, cart_id):
+    pool = await asyncpg.create_pool(
+        dsn=settings.database_url.get_secret_value(),
+        min_size=1,
+        max_size=2,
+    )
+    try:
+        async with pool.acquire() as connection:
+            session_id = await connection.fetchval(
+                """
+                INSERT INTO public.conversations (cart_id)
+                VALUES ($1)
+                RETURNING id
+                """,
+                cart_id,
+            )
+        yield pool, TextSimulator(pool, session_id)
+    finally:
+        await pool.close()
+
+
+def test_execution_results_are_scoped_to_the_conversation(database_settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            repository = SimulatorRepository(connection)
+
+            first = await repository.create_session(expected_database="restaurant_test")
+            second = await repository.create_session(
+                expected_database="restaurant_test"
+            )
+
+            execution_id = uuid4()
+            result = ToolResult(ok=True, data={"version": 1})
+
+            await repository.get_for_update(first)
+            await repository.save_execution(
+                first,
+                execution_id,
+                '{"name":"get_cart"}',
+                result,
+            )
+
+            saved = await repository.get_execution(first, execution_id)
+            assert saved.result == result
+            assert await repository.get_execution(second, execution_id) is None
+
+            # An identical transport ID can occur in a different conversation.
+            await repository.get_for_update(second)
+            await repository.save_execution(
+                second,
+                execution_id,
+                '{"name":"get_cart"}',
+                result,
+            )
+            assert await repository.get_execution(second, execution_id) is not None
+
+    asyncio.run(scenario())
+
+
+def test_conversation_replay_does_not_repeat_cart_changes(database_settings):
+    async def scenario():
+        async with committed_cart_data(database_settings) as d:
+            async with simulator_session(database_settings, d.cart_id) as (pool, first):
+                cart = await first.execute("cart")
+                initial_version = cart.data["version"]
+
+                request = first.prepare(f"update {d.line_id} 2 {d.regular_id}")
+                second = TextSimulator(pool, first.session_id)
+
+                results = await asyncio.gather(
+                    first.submit(request),
+                    second.submit(request),
+                )
+
+                assert all(result.ok for result in results)
+                assert sorted(result.replayed for result in results) == [False, True]
+                assert results[0].data == results[1].data
+
+                # Reusing the execution ID with changed arguments must fail.
+                body = json.loads(request.payload_json)
+                body["arguments"]["quantity"] = 3
+                changed = replace(
+                    request,
+                    payload_json=json.dumps(
+                        body,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                assert (
+                    await first.submit(changed)
+                ).error.code == "execution_id_conflict"
+
+                current = await first.execute("cart")
+                assert current.data["version"] == initial_version + 1
+                assert current.data["items"][0]["quantity"] == 2
+
+                assert (await first.execute(f"update {d.line_id} 3 {d.regular_id}")).ok
+
+                historical = await second.replay(request.execution_id)
+                assert historical.replayed
+                assert historical.data["version"] == initial_version + 1
+
+                assert (
+                    await second.execute("quote")
+                ).error.code == "cart_refresh_required"
+
+                current = await second.execute("cart")
+                assert current.data["version"] == initial_version + 2
+                assert current.data["items"][0]["quantity"] == 3
+
+                async with pool.acquire() as connection:
+                    assert (
+                        await connection.fetchval(
+                            """
+                            SELECT count(*)
+                            FROM public.tool_executions
+                            WHERE conversation_id=$1 AND execution_id=$2
+                            """,
+                            first.session_id,
+                            request.execution_id,
+                        )
+                        == 1
+                    )
+
+    asyncio.run(scenario())
+
+
+def test_execution_log_failure_rolls_back_the_cart_change(
+    database_settings,
+    monkeypatch,
+):
+    async def scenario():
+        async with committed_cart_data(database_settings) as d:
+            async with simulator_session(database_settings, d.cart_id) as (
+                pool,
+                simulator,
+            ):
+                initial = await simulator.execute("cart")
+                request = simulator.prepare(f"update {d.line_id} 2 {d.regular_id}")
+
+                original_save = SimulatorRepository.save_execution
+                fail_once = True
+
+                async def save_then_fail(
+                    self,
+                    session_id,
+                    execution_id,
+                    payload,
+                    result,
+                ):
+                    nonlocal fail_once
+
+                    await original_save(
+                        self,
+                        session_id,
+                        execution_id,
+                        payload,
+                        result,
+                    )
+
+                    if execution_id == request.execution_id and fail_once:
+                        fail_once = False
+
+                        # Fail after the cart change AND result insert.
+                        await self.connection.execute("SELECT 1/0")
+
+                monkeypatch.setattr(
+                    SimulatorRepository,
+                    "save_execution",
+                    save_then_fail,
+                )
+
+                assert (await simulator.submit(request)).error.code == "result_unknown"
+
+                async with pool.acquire() as connection:
+                    assert (
+                        await connection.fetchval(
+                            "SELECT version FROM public.carts WHERE id=$1",
+                            d.cart_id,
+                        )
+                        == initial.data["version"]
+                    )
+                    assert (
+                        await SimulatorRepository(connection).get_execution(
+                            simulator.session_id,
+                            request.execution_id,
+                        )
+                        is None
+                    )
+
+                # Reuse the original request, including its original version.
+                retried = await simulator.submit(request)
+
+                assert retried.ok and not retried.replayed
+                assert retried.data["version"] == initial.data["version"] + 1
+
+                assert (await simulator.submit(request)).replayed
+
+                current = await simulator.execute("cart")
+                assert current.data["items"][0]["quantity"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_replay_scenario_with_invalid_selection_and_confirmation(
+    database_settings,
+):
+    async def scenario():
+        async with committed_cart_data(
+            database_settings,
+            checkout_ready=True,
+        ) as d:
+            async with simulator_session(database_settings, d.cart_id) as (
+                pool,
+                simulator,
+            ):
+                assert (await simulator.execute("cart")).ok
+
+                invalid = simulator.prepare(f"update {d.line_id} 0 {d.regular_id}")
+                assert (
+                    await simulator.submit(invalid)
+                ).error.code == "invalid_arguments"
+                assert (await simulator.submit(invalid)).replayed
+
+                assert (await simulator.execute("cart")).ok
+
+                missing = await simulator.execute(f"update {d.line_id} 2")
+                assert missing.error.code == "too_few_options"
+
+                selection = simulator.prepare(f"options {d.regular_id}")
+                assert (await simulator.submit(selection)).ok
+                assert (await simulator.submit(selection)).replayed
+                assert (await simulator.execute("cart")).ok
+
+                async with pool.acquire() as connection:
+                    # Test fixture only: the real CLI relies on staff heartbeats.
+                    await connection.execute(
+                        """
+                        UPDATE public.restaurant_settings
+                        SET kitchen_last_seen_at=clock_timestamp()
+                        WHERE id=1
+                        """
+                    )
+
+                offered = await simulator.execute("quote")
+                assert offered.ok, offered.model_dump()
+                quote_id = UUID(offered.data["quote"]["quote_id"])
+
+                assert (await simulator.readback_completed(quote_id)).ok
+
+                old_yes = simulator.prepare("yes")
+
+                # Ambiguous input revokes an already-prepared confirmation.
+                assert (
+                    await simulator.execute("yes but make it large")
+                ).error.code == "invalid_command"
+
+                blocked = await simulator.submit(old_yes)
+                assert blocked.error.code in {
+                    "quote_not_read_back",
+                    "quote_readback_mismatch",
+                }
+
+                restarted = TextSimulator(pool, simulator.session_id)
+
+                assert (await restarted.replay(offered.execution_id)).replayed
+                assert (await restarted.execute("yes")).error.code == "review_required"
+
+                assert (await restarted.execute("review")).ok
+                assert (await restarted.readback_completed(quote_id)).ok
+
+                confirmed = restarted.prepare("yes")
+                another = TextSimulator(pool, simulator.session_id)
+
+                results = await asyncio.gather(
+                    restarted.submit(confirmed),
+                    another.submit(confirmed),
+                )
+
+                assert all(result.ok for result in results), results
+                assert sorted(result.replayed for result in results) == [False, True]
+
+                assert results[0].data["order_id"] == results[1].data["order_id"]
+                assert results[0].data["total_cents"] == 3078
+
+                # Recover the result after a simulated lost response/reconnect.
+                recovered = await TextSimulator(pool, simulator.session_id).replay(
+                    confirmed.execution_id
+                )
+
+                assert recovered.replayed
+                assert recovered.data == results[0].data
+
+                async with pool.acquire() as connection:
+                    assert (
+                        await connection.fetchval(
+                            """
+                            SELECT count(*) FROM public.orders
+                            WHERE cart_id=$1
+                            """,
+                            d.cart_id,
+                        )
+                        == 1
+                    )
 
     asyncio.run(scenario())

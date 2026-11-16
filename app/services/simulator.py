@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
@@ -42,6 +44,20 @@ SELECTION_ERRORS = {
 
 class CommandError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class PreparedCommand:
+    session_id: UUID
+    execution_id: UUID
+
+    # Immutable text prevents later dictionary changes from altering a retry.
+    payload_json: str
+
+
+class ExecutionResult(ToolResult):
+    execution_id: UUID
+    replayed: bool = False
 
 
 def parse_command(text: str) -> tuple[str, dict[str, Any]]:
@@ -122,34 +138,104 @@ class TextSimulator:
         self.stopped = False
         self._pool = pool
         self._lock = asyncio.Lock()
-        self._version: int | None = None
 
-        # Resume deliberately requires a fresh readback in this terminal.
+        self._version: int | None = None
         self._offered: UUID | None = None
         self._receipt: tuple[UUID, UUID] | None = None
+        self._draft: dict[str, Any] | None = None
+        self._pending_quote: UUID | None = None
+
+    def prepare(
+        self,
+        text: str,
+        *,
+        execution_id: UUID | None = None,
+    ) -> PreparedCommand:
+        # The trusted adapter prepares requests; these are not model arguments.
+        name, arguments = parse_command(text)
+
+        payload = {
+            "name": name,
+            "arguments": arguments,
+            "version": (self._version if name in VERSIONED | {"options"} else None),
+            "draft": (self._draft if name in {"options", "discard"} else None),
+            "quote_id": (
+                str(self._pending_quote)
+                if name == "no" and self._pending_quote
+                else None
+            ),
+            "receipt": (
+                [str(value) for value in self._receipt]
+                if name == "yes" and self._receipt
+                else None
+            ),
+        }
+
+        # Freeze the observed version, draft, and confirmation context.
+        return PreparedCommand(
+            session_id=self.session_id,
+            execution_id=execution_id or uuid4(),
+            payload_json=json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
 
     async def execute(self, text: str) -> ToolResult:
+        # Convenience entry point: a new command receives a new execution ID.
         async with self._lock:
             try:
-                name, arguments = parse_command(text)
+                request = self.prepare(text)
             except CommandError as error:
                 self._offered = self._receipt = None
-                return failure("invalid_command", str(error))
 
-            if name not in {
-                "get_menu",
-                "search_menu",
-                "get_cart",
-                "status",
-                "yes",
-            }:
-                # Corrections, rejection, and fresh quotes disarm the old offer.
-                self._offered = self._receipt = None
+                # Revoke any older prepared confirmation in PostgreSQL too.
+                return await self._run(
+                    {
+                        "name": "_invalid",
+                        "arguments": {"message": str(error)},
+                    }
+                )
 
-            return await self._run(name, arguments)
+            return await self._submit(request)
+
+    async def submit(self, request: PreparedCommand) -> ToolResult:
+        # Retry by submitting the original prepared request again.
+        async with self._lock:
+            return await self._submit(request)
+
+    async def _submit(self, request: PreparedCommand) -> ToolResult:
+        if request.session_id != self.session_id:
+            return failure(
+                "context_mismatch",
+                "This request belongs to another conversation.",
+            )
+
+        command = json.loads(request.payload_json)
+
+        if command["name"] == "yes":
+            # The prepared request already captured the receipt.
+            self._receipt = None
+        elif command["name"] not in {
+            "get_menu",
+            "search_menu",
+            "get_cart",
+            "status",
+        }:
+            self._offered = self._receipt = None
+
+        return await self._run(command, request=request)
+
+    async def replay(self, execution_id: UUID) -> ToolResult:
+        # Recovery after restart only reads a saved result.
+        # It never reconstructs or executes a missing request.
+        async with self._lock:
+            return await self._run({}, replay_id=execution_id)
 
     async def readback_completed(self, quote_id: UUID) -> ToolResult:
-        # Only the trusted CLI calls this after printing the complete quote.
+        # Only the trusted CLI calls this after printing the full quote.
         async with self._lock:
             if self._offered != quote_id:
                 return failure(
@@ -158,10 +244,16 @@ class TextSimulator:
                 )
 
             self._offered = self._receipt = None
-            result = await self._run("_readback", {"quote_id": quote_id})
+
+            result = await self._run(
+                {
+                    "name": "_readback",
+                    "arguments": {"quote_id": quote_id},
+                }
+            )
 
             if result.ok:
-                # Keep the token out of the public tool/console response.
+                # Keep the receipt token out of the public response.
                 token = UUID(result.data.pop("readback_token"))
                 self._receipt = (quote_id, token)
 
@@ -169,68 +261,186 @@ class TextSimulator:
 
     async def _run(
         self,
-        name: str,
-        arguments: dict[str, Any],
+        command: dict[str, Any],
+        *,
+        request: PreparedCommand | None = None,
+        replay_id: UUID | None = None,
     ) -> ToolResult:
+        execution_id = request.execution_id if request else replay_id
+        replayed = False
+        staff_requested = False
+
         try:
             async with self._pool.acquire(timeout=5) as connection:
                 async with connection.transaction():
-                    result = await self._execute(connection, name, arguments)
+                    repository = SimulatorRepository(connection)
+                    session = await repository.get_for_update(self.session_id)
 
-            # Local state changes happen after the database commit.
-        except (CartError, SelectionError, QuoteError, OrderError) as error:
-            result = failure(error.code, str(error))
+                    if session is None:
+                        result = failure(
+                            "session_not_found",
+                            "This conversation no longer exists.",
+                        )
+                    else:
+                        staff_requested = bool(session.staff_reason)
+
+                        saved = (
+                            await repository.get_execution(
+                                self.session_id,
+                                execution_id,
+                            )
+                            if execution_id
+                            else None
+                        )
+
+                        if saved is not None:
+                            if request and saved.request_json != request.payload_json:
+                                result = failure(
+                                    "execution_id_conflict",
+                                    "That execution ID was used with "
+                                    "a different request.",
+                                )
+                            else:
+                                result = saved.result
+                                replayed = True
+
+                        elif replay_id is not None:
+                            result = failure(
+                                "execution_not_found",
+                                "No committed result exists for this ID. "
+                                "Run status and cart.",
+                            )
+
+                        else:
+                            try:
+                                # A domain exception rolls back to this
+                                # savepoint before we record its rejection.
+                                async with connection.transaction():
+                                    result = await self._execute(
+                                        connection,
+                                        session,
+                                        command,
+                                    )
+                            except (
+                                CartError,
+                                SelectionError,
+                                QuoteError,
+                                OrderError,
+                            ) as error:
+                                result = failure(
+                                    error.code,
+                                    str(error),
+                                )
+
+                            if request is not None:
+                                # The operation and result commit together.
+                                await repository.save_execution(
+                                    self.session_id,
+                                    execution_id,
+                                    request.payload_json,
+                                    result,
+                                )
+
         except (
             asyncpg.PostgresError,
             asyncpg.InterfaceError,
             OSError,
             TimeoutError,
         ):
-            self._offered = self._receipt = None
+            replayed = False
             result = failure(
                 "result_unknown",
-                "Run status, then cart. Do not blindly repeat an edit.",
+                (
+                    "Retry the same prepared request, or replay its ID "
+                    "after reconnecting."
+                    if execution_id is not None
+                    else "Could not confirm this step. Run status, then review."
+                ),
             )
+
+        # Historical responses must not become current cart observations
+        # or enable an old quote for confirmation.
+        if (
+            replayed
+            or replay_id is not None
+            or (
+                result.error
+                and result.error.code
+                in {
+                    "result_unknown",
+                    "execution_id_conflict",
+                    "selection_changed",
+                }
+            )
+        ):
+            self._forget_observations()
+        else:
+            self._remember(command.get("name", ""), result)
+
+        if (
+            staff_requested
+            or (result.data or {}).get("status") == "staff_requested"
+            or (result.error and result.error.code == "staff_requested")
+        ):
+            self.stopped = True
+
+        if execution_id is not None:
+            return ExecutionResult(
+                **result.model_dump(),
+                execution_id=execution_id,
+                replayed=replayed,
+            )
+
+        return result
+
+    def _forget_observations(self) -> None:
+        self._version = self._draft = self._pending_quote = None
+        self._offered = self._receipt = None
+
+    def _remember(self, name: str, result: ToolResult) -> None:
+        data = result.data or {}
 
         if result.ok and name in EDITS | {"get_cart", "options"}:
             self._version = result.data["version"]
         elif not result.ok and (
             name == "get_cart"
-            or result.error.code
-            in {
-                "cart_version_conflict",
-                "quote_stale",
-                "result_unknown",
-            }
+            or result.error.code in {"cart_version_conflict", "quote_stale"}
         ):
             self._version = None
 
-        if result.ok and result.data.get("kind") == "quote":
-            self._offered = UUID(result.data["quote"]["quote_id"])
+        if "draft" in data:
+            self._draft = deepcopy(data["draft"])
+        elif result.ok and name in EDITS | {
+            "options",
+            "discard",
+            "request_staff",
+            "yes",
+        }:
+            self._draft = None
 
-        if (result.data or {}).get("status") == "staff_requested" or (
-            result.error is not None and result.error.code == "staff_requested"
+        if result.ok and name == "status":
+            self._pending_quote = (
+                UUID(data["pending_quote_id"]) if data["pending_quote_id"] else None
+            )
+        elif name in EDITS | {"options"} or (
+            result.ok and name in {"no", "yes", "request_staff"}
         ):
-            self.stopped = True
+            self._pending_quote = None
 
-        return result
+        if result.ok and data.get("kind") == "quote":
+            self._offered = self._pending_quote = UUID(data["quote"]["quote_id"])
 
     async def _execute(
         self,
         connection: asyncpg.Connection,
-        name: str,
-        arguments: dict[str, Any],
+        session: Conversation,
+        command: dict[str, Any],
     ) -> ToolResult:
+        name = command["name"]
+        arguments = command["arguments"]
+        version = command.get("version")
+
         repository = SimulatorRepository(connection)
-        session = await repository.get_for_update(self.session_id)
-
-        if session is None:
-            return failure(
-                "session_not_found",
-                "This simulator session no longer exists.",
-            )
-
-        # Customer/cart identity always comes from persisted server state.
         context = {
             "customer_id": session.customer_id,
             "cart_id": session.cart_id,
@@ -260,7 +470,7 @@ class TextSimulator:
                     "cart_id": str(session.cart_id),
                     "draft": session.draft,
                     "staff_reason": session.staff_reason,
-                    "pending_quote_id": str(pending) if pending else None,
+                    "pending_quote_id": (str(pending) if pending else None),
                     "order": (order.model_dump(mode="json") if order else None),
                 },
             )
@@ -269,6 +479,13 @@ class TextSimulator:
             return failure(
                 "staff_requested",
                 "Automated actions stopped for staff.",
+            )
+
+        if name == "_invalid":
+            await repository.clear_readback(session.cart_id)
+            return failure(
+                "invalid_command",
+                arguments["message"],
             )
 
         dispatcher = ToolDispatcher(
@@ -284,13 +501,27 @@ class TextSimulator:
             )
             if result.ok:
                 await quotes.clear_pending(session.cart_id)
-                await repository.request_staff(session, result.data["reason"])
+                await repository.request_staff(
+                    session,
+                    result.data["reason"],
+                )
             return result
 
         if name == "yes":
-            return await self._place(connection, session)
+            return await self._place(
+                connection,
+                session,
+                command.get("receipt"),
+            )
 
         if name == "no":
+            pending = await repository.pending_quote_id(session.cart_id)
+            if pending is None or str(pending) != command.get("quote_id"):
+                return failure(
+                    "quote_changed",
+                    "Run status or review before rejecting a quote.",
+                )
+
             await quotes.clear_pending(session.cart_id)
             return ToolResult(
                 ok=True,
@@ -298,7 +529,12 @@ class TextSimulator:
             )
 
         if name == "discard":
-            await quotes.clear_pending(session.cart_id)
+            if session.draft != command.get("draft"):
+                return failure(
+                    "selection_changed",
+                    "Run status and review the current draft.",
+                )
+
             await repository.set_draft(session.id, None)
             return ToolResult(
                 ok=True,
@@ -319,7 +555,10 @@ class TextSimulator:
         if name == "review":
             quote_id = await repository.pending_quote_id(session.cart_id)
             if quote_id is None:
-                return failure("quote_required", "Run cart, then quote.")
+                return failure(
+                    "quote_required",
+                    "Run cart, then quote.",
+                )
 
             quote = await get_quote(
                 connection,
@@ -349,11 +588,11 @@ class TextSimulator:
             )
 
         if name in EDITS | {"options"}:
-            # A correction also disarms quotes shown by another terminal.
+            # A correction invalidates quotes displayed by other terminals.
             await quotes.clear_pending(session.cart_id)
 
         if name in VERSIONED | {"options"}:
-            if self._version is None:
+            if version is None:
                 return failure(
                     "cart_refresh_required",
                     "Run cart and review its contents first.",
@@ -366,23 +605,29 @@ class TextSimulator:
                         "Start with add or update.",
                     )
 
+                if session.draft != command.get("draft"):
+                    return failure(
+                        "selection_changed",
+                        "Run status and cart before completing this draft.",
+                    )
+
                 name = session.draft["name"]
                 arguments = {
                     **session.draft["arguments"],
                     **arguments,
                 }
 
-                # Never silently apply an old intention to a newer cart.
-                if arguments["expected_version"] != self._version:
+                if arguments["expected_version"] != version:
                     await repository.set_draft(session.id, None)
                     return failure(
                         "cart_version_conflict",
                         "The cart changed. Read cart and restate the edit.",
                     )
             else:
+                # Use the version frozen when the request was prepared.
                 arguments = {
                     **arguments,
-                    "expected_version": self._version,
+                    "expected_version": version,
                 }
 
         if name in EDITS:
@@ -394,25 +639,28 @@ class TextSimulator:
             connection=connection,
         )
 
-        if name in {"add_cart_item", "update_cart_item"} and not result.ok:
-            if result.error.code in SELECTION_ERRORS:
-                draft = {
-                    "name": name,
-                    "arguments": arguments,
-                }
-                await repository.set_draft(session.id, draft)
+        if (
+            name in {"add_cart_item", "update_cart_item"}
+            and not result.ok
+            and result.error.code in SELECTION_ERRORS
+        ):
+            draft = {
+                "name": name,
+                "arguments": arguments,
+            }
+            await repository.set_draft(session.id, draft)
 
-                result = result.model_copy(
-                    update={
-                        "data": {
-                            "draft": draft,
-                            "next": (
-                                "Read menu; use options with the complete "
-                                "option list, or discard."
-                            ),
-                        }
+            result = result.model_copy(
+                update={
+                    "data": {
+                        "draft": draft,
+                        "next": (
+                            "Read menu; use options with the complete "
+                            "option list, or discard."
+                        ),
                     }
-                )
+                }
+            )
 
         if name == "create_quote" and result.ok:
             result = ToolResult(
@@ -426,6 +674,7 @@ class TextSimulator:
         self,
         connection: asyncpg.Connection,
         session: Conversation,
+        receipt: list[str] | None,
     ) -> ToolResult:
         context = {
             "cart_id": session.cart_id,
@@ -433,7 +682,7 @@ class TextSimulator:
         }
         orders = OrderRepository(connection)
 
-        # Recover an already committed order before requiring confirmation again.
+        # Recover an existing order before checking confirmation again.
         existing = await orders.get_for_cart(**context)
         if existing is not None:
             return ToolResult(
@@ -447,16 +696,15 @@ class TextSimulator:
                 "Finish or discard the pending selection.",
             )
 
-        if self._receipt is None:
+        if receipt is None:
             return failure(
                 "review_required",
                 "Run review and read the full quote first.",
             )
 
-        quote_id, token = self._receipt
-        self._receipt = None
+        quote_id, token = (UUID(value) for value in receipt)
 
-        # Match the ordering service's lock order: cart -> catalog -> quote.
+        # Preserve the established cart -> catalog -> quote lock order.
         await orders.lock_catalog()
 
         await confirm_quote(
@@ -474,7 +722,6 @@ class TextSimulator:
         )
 
         if isinstance(order, CheckoutNeedsReview):
-            # Commit its invalidation/replacement and require another readback.
             return failure(order.code, order.message)
 
         return ToolResult(

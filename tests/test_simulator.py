@@ -13,6 +13,7 @@ from app.cli import simulator as cli
 from app.config import Settings
 from app.repositories.simulator import (
     Conversation,
+    SavedExecution,
     SimulatorConfigurationError,
 )
 from app.schemas.tools import FUNCTIONS, ToolError, ToolResult
@@ -49,6 +50,9 @@ def harness(monkeypatch):
     repository = SimpleNamespace(
         get_for_update=AsyncMock(side_effect=lambda _: state.session),
         pending_quote_id=AsyncMock(return_value=uuid4()),
+        get_execution=AsyncMock(return_value=None),
+        save_execution=AsyncMock(),
+        clear_readback=AsyncMock(),
     )
 
     async def save_draft(_, draft):
@@ -449,5 +453,282 @@ def test_dispatcher_uses_supplied_connection_and_propagates_database_failure():
                 "{}",
                 connection=connection,
             )
+
+    asyncio.run(scenario())
+
+
+def execution_store(h):
+    saved = {}
+
+    async def get(session_id, execution_id):
+        return saved.get((session_id, execution_id))
+
+    async def save(session_id, execution_id, request_json, result):
+        saved[(session_id, execution_id)] = SavedExecution(
+            request_json,
+            ToolResult.model_validate_json(result.model_dump_json()),
+        )
+
+    h.repository.get_execution.side_effect = get
+    h.repository.save_execution.side_effect = save
+    return saved
+
+
+def test_duplicate_request_returns_saved_result_and_rejects_changed_payload(
+    harness,
+):
+    async def scenario():
+        h = harness
+        execution_store(h)
+        await h.simulator.execute("cart")
+
+        request = h.simulator.prepare(f"add {ITEM} 1 {OPTION}")
+        h.dispatcher.dispatch.reset_mock()
+        h.dispatcher.dispatch.return_value = success(version=1)
+
+        first = await h.simulator.submit(request)
+        repeated = await h.simulator.submit(request)
+
+        assert first.ok and not first.replayed
+        assert repeated.ok and repeated.replayed
+        assert repeated.data == first.data
+        assert repeated.execution_id == first.execution_id
+        assert first.execution_id == request.execution_id
+        h.dispatcher.dispatch.assert_awaited_once()
+
+        body = json.loads(request.payload_json)
+        body["arguments"]["quantity"] = 2
+        changed = replace(
+            request,
+            payload_json=json.dumps(
+                body,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+        assert (await h.simulator.submit(changed)).error.code == "execution_id_conflict"
+
+        h.dispatcher.dispatch.assert_awaited_once()
+
+        assert (
+            await h.simulator.execute("quote")
+        ).error.code == "cart_refresh_required"
+
+    asyncio.run(scenario())
+
+
+def test_new_request_ids_allow_intentional_repeated_additions(harness):
+    async def scenario():
+        h = harness
+        execution_store(h)
+        await h.simulator.execute("cart")
+
+        first = h.simulator.prepare(f"add {ITEM} 1 {OPTION}")
+        h.dispatcher.dispatch.return_value = success(version=1)
+        assert (await h.simulator.submit(first)).ok
+
+        second = h.simulator.prepare(f"add {ITEM} 1 {OPTION}")
+        assert second.execution_id != first.execution_id
+        assert json.loads(first.payload_json)["version"] == 0
+        assert json.loads(second.payload_json)["version"] == 1
+
+        h.dispatcher.dispatch.return_value = success(version=2)
+        assert (await h.simulator.submit(second)).ok
+
+    asyncio.run(scenario())
+
+
+def test_unknown_outcome_retries_the_frozen_version(harness):
+    async def scenario():
+        h = harness
+        execution_store(h)
+        await h.simulator.execute("cart")
+
+        request = h.simulator.prepare(f"add {ITEM} 1 {OPTION}")
+        h.dispatcher.dispatch.reset_mock()
+        h.dispatcher.dispatch.side_effect = [
+            asyncpg.PostgresError("Disconnected"),
+            success(version=1),
+        ]
+
+        assert (await h.simulator.submit(request)).error.code == "result_unknown"
+
+        assert (await h.simulator.submit(request)).ok
+        assert (await h.simulator.submit(request)).replayed
+        assert h.dispatcher.dispatch.await_count == 2
+
+        for call in h.dispatcher.dispatch.await_args_list:
+            assert json.loads(call.args[1])["expected_version"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_prepared_edit_does_not_take_a_newer_observed_version(harness):
+    async def scenario():
+        h = harness
+        await h.simulator.execute("cart")
+
+        request = h.simulator.prepare(f"update {LINE} 2 {OPTION}")
+
+        h.dispatcher.dispatch.return_value = success(version=9)
+        await h.simulator.execute("cart")
+
+        h.dispatcher.dispatch.return_value = rejected("cart_version_conflict")
+        assert (await h.simulator.submit(request)).error.code == "cart_version_conflict"
+
+        arguments = json.loads(h.dispatcher.dispatch.await_args.args[1])
+        assert arguments["expected_version"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_invalid_function_arguments_are_saved_and_replayed(harness):
+    async def scenario():
+        h = harness
+        execution_store(h)
+        await h.simulator.execute("cart")
+
+        request = h.simulator.prepare(f"add {ITEM} 0")
+        h.dispatcher.dispatch.reset_mock()
+        h.dispatcher.dispatch.return_value = rejected("invalid_arguments")
+
+        first = await h.simulator.submit(request)
+        again = await h.simulator.submit(request)
+
+        assert first.error.code == "invalid_arguments"
+        assert again.error.code == "invalid_arguments"
+        assert again.replayed
+        h.dispatcher.dispatch.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_replayed_quote_never_enables_confirmation(harness, monkeypatch):
+    async def scenario():
+        h = harness
+        execution_store(h)
+        await h.simulator.execute("cart")
+
+        request = h.simulator.prepare("quote")
+        h.dispatcher.dispatch.return_value = success(**quote_data())
+        assert (await h.simulator.submit(request)).ok
+
+        replayed = await h.simulator.replay(request.execution_id)
+        assert replayed.replayed
+
+        assert (
+            await h.simulator.readback_completed(service.UUID(QUOTE))
+        ).error.code == "review_required"
+
+        assert (await h.simulator.execute("yes")).error.code == "review_required"
+
+        return replayed
+
+    result = asyncio.run(scenario())
+    terminal = SimpleNamespace(readback_completed=AsyncMock())
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *args, **kwargs: None,
+    )
+
+    with asyncio.Runner() as runner:
+        cli.display_result(terminal, runner, result)
+
+    terminal.readback_completed.assert_not_awaited()
+
+
+def test_missing_execution_and_wrong_context_do_not_dispatch(harness):
+    async def scenario():
+        h = harness
+
+        assert (await h.simulator.replay(uuid4())).error.code == "execution_not_found"
+
+        request = replace(
+            h.simulator.prepare("menu"),
+            session_id=uuid4(),
+        )
+        assert (await h.simulator.submit(request)).error.code == "context_mismatch"
+
+        h.dispatcher.dispatch.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_options_cannot_complete_a_different_pending_draft(harness):
+    async def scenario():
+        h = harness
+        await h.simulator.execute("cart")
+        h.dispatcher.dispatch.return_value = rejected("too_few_options")
+        await h.simulator.execute(f"add {ITEM} 1")
+
+        request = h.simulator.prepare(f"options {OPTION}")
+
+        newer = json.loads(json.dumps(h.state.session.draft))
+        newer["arguments"]["quantity"] = 2
+        h.state.session = replace(h.state.session, draft=newer)
+
+        h.dispatcher.dispatch.reset_mock()
+        result = await h.simulator.submit(request)
+
+        assert result.error.code == "selection_changed"
+        assert h.state.session.draft == newer
+        h.dispatcher.dispatch.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_no_remains_bound_to_the_original_quote(harness):
+    async def scenario():
+        h = harness
+        await h.simulator.execute("status")
+        request = h.simulator.prepare("no")
+
+        h.repository.pending_quote_id.return_value = uuid4()
+
+        assert (await h.simulator.submit(request)).error.code == "quote_changed"
+
+        h.quotes.clear_pending.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_mixed_confirmation_revokes_prepared_receipts(harness):
+    async def scenario():
+        h = harness
+        await h.simulator.execute("review")
+        await h.simulator.readback_completed(service.UUID(QUOTE))
+
+        old_yes = h.simulator.prepare("yes")
+
+        assert not (await h.simulator.execute("yes but remove something")).ok
+
+        h.repository.clear_readback.assert_awaited_once_with(h.state.session.cart_id)
+
+        h.confirm.side_effect = service.QuoteError(
+            "quote_not_read_back",
+            "Review again",
+        )
+
+        assert (await h.simulator.submit(old_yes)).error.code == "quote_not_read_back"
+
+        h.place.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_failed_replay_does_not_claim_a_saved_result_was_returned(harness):
+    async def scenario():
+        h = harness
+        execution_store(h)
+
+        request = h.simulator.prepare("cart")
+        assert (await h.simulator.submit(request)).ok
+
+        h.transaction.__aexit__.side_effect = asyncpg.PostgresError("Connection lost")
+
+        result = await h.simulator.replay(request.execution_id)
+        assert result.error.code == "result_unknown"
+        assert not result.replayed
 
     asyncio.run(scenario())
