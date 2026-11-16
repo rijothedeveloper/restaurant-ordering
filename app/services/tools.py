@@ -67,7 +67,13 @@ class ToolDispatcher:
         self._lock = asyncio.Lock()
         self._staff_reason: str | None = None
 
-    async def dispatch(self, name: str, arguments_json: str) -> ToolResult:
+    async def dispatch(
+        self,
+        name: str,
+        arguments_json: str,
+        *,
+        connection: asyncpg.Connection | None = None,
+    ) -> ToolResult:
         # Serialize this conversation's actions. Database versions still protect
         # against edits arriving through another process or dispatcher.
         async with self._lock:
@@ -124,8 +130,12 @@ class ToolDispatcher:
                 )
 
             try:
-                # Borrow a connection only for this operation, not the conversation.
-                async with self._pool.acquire(timeout=5) as connection:
+                if connection is None:
+                    # Existing callers continue to borrow their own connection.
+                    async with self._pool.acquire(timeout=5) as acquired:
+                        value = await self._execute(acquired, name, arguments)
+                else:
+                    # The conversation coordinator supplies its transaction's connection.
                     value = await self._execute(connection, name, arguments)
 
             except (CartError, SelectionError, QuoteError, OrderError) as error:
@@ -137,7 +147,11 @@ class ToolDispatcher:
                 OSError,
                 TimeoutError,
             ):
-                # A lost response is not proof that a write failed. Do not retry here.
+                if connection is not None:
+                    # Let the outer conversation transaction roll back.
+
+                    raise
+
                 return failure(
                     "result_unknown",
                     "Could not confirm the result. Read current state before retrying.",

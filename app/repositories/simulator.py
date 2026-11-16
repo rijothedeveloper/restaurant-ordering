@@ -1,3 +1,6 @@
+import json
+from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
 import asyncpg
@@ -7,21 +10,33 @@ class SimulatorConfigurationError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class Conversation:
+    id: UUID
+    customer_id: UUID
+    cart_id: UUID
+    draft: dict[str, Any] | None
+    staff_reason: str | None
+
+
 class SimulatorRepository:
     def __init__(self, connection: asyncpg.Connection) -> None:
         self.connection = connection
 
-    async def create_context(
-        self, *, expected_database: str = "restaurant_dev"
-    ) -> tuple[UUID, UUID]:
-        # Check the actual database before inserting any development data.
+    async def require_database(self, expected_database: str) -> None:
+        # Inspect the actual connection as well as checking the URL in the CLI.
         database = await self.connection.fetchval("SELECT current_database()")
         if database != expected_database:
             raise SimulatorConfigurationError(
                 f"Simulator requires the {expected_database} database."
             )
 
-        # Both records commit together; a cart failure must not leave an orphan.
+    async def create_context(
+        self, *, expected_database: str = "restaurant_dev"
+    ) -> tuple[UUID, UUID]:
+        # Retain the Lesson 2 helper and its atomic customer/cart creation.
+        await self.require_database(expected_database)
+
         async with self.connection.transaction():
             customer_id = await self.connection.fetchval(
                 "INSERT INTO public.customers DEFAULT VALUES RETURNING id"
@@ -32,3 +47,103 @@ class SimulatorRepository:
             )
 
         return customer_id, cart_id
+
+    async def create_session(
+        self, *, expected_database: str = "restaurant_dev"
+    ) -> UUID:
+        # A conversation failure must also roll back its customer and cart.
+        async with self.connection.transaction():
+            _, cart_id = await self.create_context(expected_database=expected_database)
+            return await self.connection.fetchval(
+                """
+                INSERT INTO public.conversations (cart_id)
+                VALUES ($1)
+                RETURNING id
+                """,
+                cart_id,
+            )
+
+    async def require_session(
+        self,
+        session_id: UUID,
+        *,
+        expected_database: str = "restaurant_dev",
+    ) -> None:
+        await self.require_database(expected_database)
+
+        exists = await self.connection.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM public.conversations WHERE id=$1)",
+            session_id,
+        )
+        if not exists:
+            raise SimulatorConfigurationError("Simulator session was not found.")
+
+    async def get_for_update(self, session_id: UUID) -> Conversation | None:
+        # Call inside a transaction: conversation first, then its cart.
+        row = await self.connection.fetchrow(
+            """
+            SELECT c.id, c.cart_id, c.draft, c.staff_reason, cart.customer_id
+            FROM public.conversations c
+            JOIN public.carts cart ON cart.id = c.cart_id
+            WHERE c.id = $1
+            FOR UPDATE OF c
+            """,
+            session_id,
+        )
+        if row is None:
+            return None
+
+        await self.connection.fetchval(
+            "SELECT id FROM public.carts WHERE id=$1 FOR UPDATE",
+            row["cart_id"],
+        )
+
+        return Conversation(
+            id=row["id"],
+            customer_id=row["customer_id"],
+            cart_id=row["cart_id"],
+            # asyncpg's default JSONB codec returns a JSON string.
+            draft=(json.loads(row["draft"]) if row["draft"] is not None else None),
+            staff_reason=row["staff_reason"],
+        )
+
+    async def set_draft(
+        self,
+        session_id: UUID,
+        draft: dict[str, Any] | None,
+    ) -> None:
+        await self.connection.execute(
+            "UPDATE public.conversations SET draft=$2::jsonb WHERE id=$1",
+            session_id,
+            json.dumps(draft) if draft is not None else None,
+        )
+
+    async def request_staff(
+        self,
+        conversation: Conversation,
+        reason: str,
+    ) -> None:
+        await self.connection.execute(
+            """
+            UPDATE public.conversations
+            SET staff_reason=$2, draft=NULL
+            WHERE id=$1
+            """,
+            conversation.id,
+            reason,
+        )
+
+        # Existing cart services also reject edits after this handoff.
+        await self.connection.execute(
+            """
+            UPDATE public.carts SET status='HUMAN_REQUIRED'
+            WHERE id=$1 AND status='BUILDING'
+            """,
+            conversation.cart_id,
+        )
+
+    async def pending_quote_id(self, cart_id: UUID) -> UUID | None:
+        return await self.connection.fetchval(
+            "SELECT id FROM public.quotes WHERE cart_id=$1 AND is_pending",
+            cart_id,
+        )

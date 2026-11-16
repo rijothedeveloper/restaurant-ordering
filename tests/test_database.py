@@ -50,6 +50,7 @@ from app.services.quote import (
     create_quote,
     get_quote,
 )
+from app.services.simulator import TextSimulator
 from app.services.staff_orders import (
     StaffOrderError,
     change_order_status,
@@ -4007,6 +4008,7 @@ def test_staff_queue_and_snapshot_details(database_settings):
 
     asyncio.run(scenario())
 
+
 async def create_staff_test_order(connection):
     context, _, _, quote = await prepare_pending_quote(connection)
     await confirm_test_quote(connection, context, quote)
@@ -4038,9 +4040,7 @@ def test_staff_order_workflow(database_settings):
                     expected_status=before,
                     status=after,
                 )
-                result = await change_order_status(
-                    connection, **target, change=change
-                )
+                result = await change_order_status(connection, **target, change=change)
 
                 # A repeated action must not create another audit event.
                 repeated = await change_order_status(
@@ -4056,9 +4056,7 @@ def test_staff_order_workflow(database_settings):
             )
 
             with pytest.raises(StaffOrderError) as error:
-                await change_order_status(
-                    connection, **target, change=complete
-                )
+                await change_order_status(connection, **target, change=complete)
             assert error.value.code == "payment_required"
 
             paid = await mark_order_paid(connection, **target)
@@ -4066,9 +4064,7 @@ def test_staff_order_workflow(database_settings):
             assert paid.payment_status == "PAID"
             assert await mark_order_paid(connection, **target) == paid
 
-            done = await change_order_status(
-                connection, **target, change=complete
-            )
+            done = await change_order_status(connection, **target, change=complete)
             assert done.status == "COMPLETED"
 
             # Staff actions must not change the purchased item or price snapshots.
@@ -4114,9 +4110,7 @@ def test_staff_order_workflow(database_settings):
         ("READY", "CANCELLED"),
     ],
 )
-def test_staff_order_close_with_reason(
-    database_settings, before, after
-):
+def test_staff_order_close_with_reason(database_settings, before, after):
     async def scenario():
         async with isolated_data(database_settings) as connection:
             saved = await create_staff_test_order(connection)
@@ -4138,9 +4132,7 @@ def test_staff_order_close_with_reason(
                 reason="  Customer requested  ",
             )
 
-            result = await change_order_status(
-                connection, **target, change=change
-            )
+            result = await change_order_status(connection, **target, change=change)
             assert result.status == after
             assert result.payment_status == "UNPAID"
             assert await StaffOrderRepository(connection).list_active() == []
@@ -4203,9 +4195,7 @@ def test_staff_order_rejects_invalid_change(
                 expected_status=expected,
                 status=target,
                 reason=(
-                    "Not available"
-                    if target in {"REJECTED", "CANCELLED"}
-                    else None
+                    "Not available" if target in {"REJECTED", "CANCELLED"} else None
                 ),
             )
 
@@ -4260,9 +4250,7 @@ def test_staff_payment_requires_ready_order(database_settings, status):
 
 
 @pytest.mark.parametrize("action", ["status", "paid"])
-def test_staff_action_rollback(
-    database_settings, monkeypatch, action
-):
+def test_staff_action_rollback(database_settings, monkeypatch, action):
     original = StaffOrderRepository.append_event
 
     async def fail_after_event(self, *args):
@@ -4394,15 +4382,11 @@ def test_staff_concurrent_actions(
                         # Hold the winning transaction open until PostgreSQL
                         # confirms that the second connection is waiting.
                         async with first.transaction():
-                            winner = await act(
-                                first, first_action, "staff-a"
-                            )
+                            winner = await act(first, first_action, "staff-a")
                             pending = asyncio.create_task(
                                 act(second, second_action, "staff-b")
                             )
-                            await wait_for_database_block(
-                                first, second, pending
-                            )
+                            await wait_for_database_block(first, second, pending)
 
                         if error_code is None:
                             result = await asyncio.wait_for(pending, 5)
@@ -4412,9 +4396,7 @@ def test_staff_concurrent_actions(
                                 await asyncio.wait_for(pending, 5)
                             assert error.value.code == error_code
 
-                        current = await StaffOrderRepository(first).get(
-                            saved.order_id
-                        )
+                        current = await StaffOrderRepository(first).get(saved.order_id)
                         assert current == winner
 
                         event_count = await first.fetchval(
@@ -4431,6 +4413,7 @@ def test_staff_concurrent_actions(
                         await settle_test_task(pending)
 
     asyncio.run(scenario())
+
 
 def test_kitchen_heartbeat_preserves_manual_pause(database_settings):
     async def scenario():
@@ -4488,25 +4471,22 @@ def test_kitchen_offline_blocks_checkout_and_saved_order_retries_work(
                 """
             )
 
-            result = await place_order(
-                connection, **context, quote_id=quote.quote_id
-            )
+            result = await place_order(connection, **context, quote_id=quote.quote_id)
             assert isinstance(result, CheckoutNeedsReview)
             assert result.code == "kitchen_offline"
-            assert await connection.fetchval(
-                "SELECT count(*) FROM public.orders"
-            ) == 0
+            assert await connection.fetchval("SELECT count(*) FROM public.orders") == 0
 
-            assert await connection.fetchval(
-                "SELECT is_pending FROM public.quotes WHERE id=$1",
-                quote.quote_id,
-            ) is False
+            assert (
+                await connection.fetchval(
+                    "SELECT is_pending FROM public.quotes WHERE id=$1",
+                    quote.quote_id,
+                )
+                is False
+            )
 
             # After reconnecting, obtain and confirm a new quote.
             await KitchenRepository(connection).heartbeat()
-            replacement = await create_quote(
-                connection, **context, expected_version=1
-            )
+            replacement = await create_quote(connection, **context, expected_version=1)
             await confirm_test_quote(connection, context, replacement)
 
             saved = await place_order(
@@ -4525,11 +4505,14 @@ def test_kitchen_offline_blocks_checkout_and_saved_order_retries_work(
             )
 
             # Recovering a committed order must still work while offline.
-            assert await place_order(
-                connection,
-                **context,
-                quote_id=replacement.quote_id,
-            ) == saved
+            assert (
+                await place_order(
+                    connection,
+                    **context,
+                    quote_id=replacement.quote_id,
+                )
+                == saved
+            )
 
     asyncio.run(scenario())
 
@@ -4540,9 +4523,7 @@ def test_kitchen_availability_blocks_new_quotes_but_preserves_saved_orders(
 ):
     async def scenario():
         async with isolated_data(database_settings) as connection:
-            context, item_id, option_id, quote = (
-                await prepare_pending_quote(connection)
-            )
+            context, item_id, option_id, quote = await prepare_pending_quote(connection)
             await confirm_test_quote(connection, context, quote)
             admin = MenuAdminRepository(connection)
 
@@ -4557,16 +4538,12 @@ def test_kitchen_availability_blocks_new_quotes_but_preserves_saved_orders(
                 await create_quote(connection, **context, expected_version=1)
             assert error.value.code == "invalid_cart"
 
-            result = await place_order(
-                connection, **context, quote_id=quote.quote_id
-            )
+            result = await place_order(connection, **context, quote_id=quote.quote_id)
             assert isinstance(result, CheckoutNeedsReview)
             assert result.code == "invalid_cart"
 
             assert await available(True)
-            replacement = await create_quote(
-                connection, **context, expected_version=1
-            )
+            replacement = await create_quote(connection, **context, expected_version=1)
             await confirm_test_quote(connection, context, replacement)
 
             saved = await place_order(
@@ -4584,19 +4561,25 @@ def test_kitchen_availability_blocks_new_quotes_but_preserves_saved_orders(
             )
             assert restored == saved
 
-            assert await connection.fetchval(
-                "SELECT price_cents FROM public.menu_items WHERE id=$1",
-                item_id,
-            ) == 1399
+            assert (
+                await connection.fetchval(
+                    "SELECT price_cents FROM public.menu_items WHERE id=$1",
+                    item_id,
+                )
+                == 1399
+            )
 
-            assert await connection.fetchval(
-                """
+            assert (
+                await connection.fetchval(
+                    """
                 SELECT price_delta_cents
                 FROM public.modifier_options
                 WHERE id=$1
                 """,
-                option_id,
-            ) == 300
+                    option_id,
+                )
+                == 300
+            )
 
     asyncio.run(scenario())
 
@@ -4625,9 +4608,9 @@ def test_kitchen_change_is_checked_after_checkout_waits(
                     try:
                         async with first.transaction():
                             if change == "pause":
-                                await KitchenRepository(
-                                    first
-                                ).set_ordering_enabled(False)
+                                await KitchenRepository(first).set_ordering_enabled(
+                                    False
+                                )
                             elif change == "offline":
                                 await first.execute(
                                     """
@@ -4657,10 +4640,13 @@ def test_kitchen_change_is_checked_after_checkout_waits(
                         assert isinstance(result, CheckoutNeedsReview)
                         assert result.code == code
 
-                        assert await first.fetchval(
-                            "SELECT count(*) FROM public.orders WHERE cart_id=$1",
-                            d.cart_id,
-                        ) == 0
+                        assert (
+                            await first.fetchval(
+                                "SELECT count(*) FROM public.orders WHERE cart_id=$1",
+                                d.cart_id,
+                            )
+                            == 0
+                        )
                     finally:
                         await settle_test_task(pending)
 
@@ -4668,9 +4654,7 @@ def test_kitchen_change_is_checked_after_checkout_waits(
 
 
 @pytest.mark.parametrize("change", ["pause", "item"])
-def test_kitchen_change_waits_for_successful_checkout(
-    database_settings, change
-):
+def test_kitchen_change_waits_for_successful_checkout(database_settings, change):
     async def scenario():
         async with confirmed_checkout_data(database_settings) as d:
             async with database_app(database_settings) as app:
@@ -4690,18 +4674,21 @@ def test_kitchen_change_waits_for_successful_checkout(
                                     second
                                 ).set_ordering_enabled(False)
                             else:
-                                operation = MenuAdminRepository(
-                                    second
-                                ).update_item(d.item_id, None, False)
+                                operation = MenuAdminRepository(second).update_item(
+                                    d.item_id, None, False
+                                )
 
                             pending = asyncio.create_task(operation)
                             await wait_for_database_block(first, second, pending)
 
                         assert await asyncio.wait_for(pending, 5) is True
 
-                        assert await OrderRepository(first).get(
-                            saved.order_id, d.customer_id
-                        ) == saved
+                        assert (
+                            await OrderRepository(first).get(
+                                saved.order_id, d.customer_id
+                            )
+                            == saved
+                        )
                     finally:
                         await settle_test_task(pending)
 
@@ -4722,9 +4709,7 @@ def test_kitchen_heartbeat_cannot_overwrite_a_concurrent_pause(
 
                     try:
                         async with first.transaction():
-                            await KitchenRepository(
-                                first
-                            ).set_ordering_enabled(False)
+                            await KitchenRepository(first).set_ordering_enabled(False)
 
                             pending = asyncio.create_task(
                                 KitchenRepository(second).heartbeat()
@@ -4733,9 +4718,7 @@ def test_kitchen_heartbeat_cannot_overwrite_a_concurrent_pause(
 
                         assert await asyncio.wait_for(pending, 5) is True
 
-                        config = await RestaurantConfigurationRepository(
-                            first
-                        ).get()
+                        config = await RestaurantConfigurationRepository(first).get()
                         now = await first.fetchval("SELECT clock_timestamp()")
 
                         assert config.ordering_enabled is False
@@ -4744,6 +4727,7 @@ def test_kitchen_heartbeat_cannot_overwrite_a_concurrent_pause(
                         await settle_test_task(pending)
 
     asyncio.run(scenario())
+
 
 def test_tool_dispatcher_checkout_and_confirmation(database_settings):
     async def scenario():
@@ -4890,6 +4874,7 @@ def test_tool_dispatcher_checkout_and_confirmation(database_settings):
 
     asyncio.run(scenario())
 
+
 def test_simulator_creates_separate_customer_cart_contexts(database_settings):
     async def scenario():
         async with isolated_data(database_settings) as connection:
@@ -4938,5 +4923,269 @@ def test_simulator_failed_cart_insert_rolls_back_customer(database_settings):
                 await connection.fetchval("SELECT count(*) FROM public.customers") == 0
             )
             assert await connection.fetchval("SELECT count(*) FROM public.carts") == 0
+
+    asyncio.run(scenario())
+
+
+def test_conversation_persists_draft_and_staff_handoff(database_settings):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            repository = SimulatorRepository(connection)
+            session_id = await repository.create_session(
+                expected_database="restaurant_test"
+            )
+            session = await repository.get_for_update(session_id)
+
+            await repository.require_session(
+                session_id,
+                expected_database="restaurant_test",
+            )
+
+            draft = {
+                "name": "add_cart_item",
+                "arguments": {
+                    "item_id": str(uuid4()),
+                    "quantity": 1,
+                    "option_ids": [],
+                    "expected_version": 0,
+                },
+            }
+            await repository.set_draft(session_id, draft)
+
+            resumed = await SimulatorRepository(connection).get_for_update(session_id)
+
+            assert resumed.customer_id == session.customer_id
+            assert resumed.cart_id == session.cart_id
+            assert resumed.draft == draft
+
+            await repository.request_staff(resumed, "Customer needs assistance")
+            resumed = await repository.get_for_update(session_id)
+
+            assert resumed.draft is None
+            assert resumed.staff_reason == "Customer needs assistance"
+            assert (
+                await connection.fetchval(
+                    "SELECT status FROM public.carts WHERE id=$1",
+                    session.cart_id,
+                )
+                == "HUMAN_REQUIRED"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_failed_conversation_insert_rolls_back_customer_and_cart(
+    database_settings,
+):
+    async def scenario():
+        async with isolated_data(database_settings) as connection:
+            await connection.execute(
+                """
+                ALTER TABLE public.conversations
+                ADD CONSTRAINT conversation_test_reject CHECK (false)
+                """
+            )
+
+            with pytest.raises(asyncpg.CheckViolationError):
+                await SimulatorRepository(connection).create_session(
+                    expected_database="restaurant_test"
+                )
+
+            for table in ("customers", "carts", "conversations"):
+                # Fixed test-only identifiers; never user input.
+                assert (
+                    await connection.fetchval(f"SELECT count(*) FROM public.{table}")
+                    == 0
+                )
+
+    asyncio.run(scenario())
+
+
+def test_simulator_resumes_selection_and_places_once(database_settings):
+    async def scenario():
+        async with committed_cart_data(database_settings, checkout_ready=True) as d:
+            pool = await asyncpg.create_pool(
+                dsn=database_settings.database_url.get_secret_value(),
+                min_size=1,
+                max_size=2,
+            )
+
+            try:
+                async with pool.acquire() as connection:
+                    session_id = await connection.fetchval(
+                        """
+                        INSERT INTO public.conversations (cart_id)
+                        VALUES ($1)
+                        RETURNING id
+                        """,
+                        d.cart_id,
+                    )
+
+                first = TextSimulator(pool, session_id)
+                assert (await first.execute("cart")).ok
+
+                failed = await first.execute(f"update {d.line_id} 2")
+                assert failed.error.code == "too_few_options"
+
+                resumed = TextSimulator(pool, session_id)
+                assert (await resumed.execute("status")).data[
+                    "status"
+                ] == "selection_pending"
+                assert (
+                    await resumed.execute("quote")
+                ).error.code == "selection_pending"
+                assert (
+                    await resumed.execute(f"options {d.regular_id}")
+                ).error.code == "cart_refresh_required"
+
+                assert (await resumed.execute("cart")).ok
+                assert (await resumed.execute(f"options {d.regular_id}")).ok
+
+                async with pool.acquire() as connection:
+                    # Test fixture only; the actual CLI uses staff heartbeats.
+                    await connection.execute(
+                        """
+                        UPDATE public.restaurant_settings
+                        SET kitchen_last_seen_at=clock_timestamp()
+                        WHERE id=1
+                        """
+                    )
+
+                offered = await resumed.execute("quote")
+                assert offered.ok, offered.model_dump()
+                quote_id = UUID(offered.data["quote"]["quote_id"])
+
+                assert (await resumed.execute("yes")).error.code == "review_required"
+                assert (await resumed.readback_completed(quote_id)).ok
+
+                assert not (await resumed.execute("yes but make a change")).ok
+                assert (await resumed.execute("yes")).error.code == "review_required"
+
+                assert (await resumed.execute("review")).ok
+                assert (await resumed.readback_completed(quote_id)).ok
+
+                restarted = TextSimulator(pool, session_id)
+                assert (await restarted.execute("yes")).error.code == "review_required"
+                assert (await restarted.execute("review")).ok
+                assert (await restarted.readback_completed(quote_id)).ok
+
+                # A newer readback rotates the token.
+                # Concurrent confirmations share the database locks.
+                old, placed = await asyncio.gather(
+                    resumed.execute("yes"),
+                    restarted.execute("yes"),
+                )
+
+                assert placed.ok, placed.model_dump()
+                assert old.ok or old.error.code == "quote_readback_mismatch"
+                assert placed.data["total_cents"] == 3078
+
+                again = await restarted.execute("yes")
+                assert again.data["order_id"] == placed.data["order_id"]
+
+                async with pool.acquire() as connection:
+                    assert (
+                        await connection.fetchval(
+                            """
+                            SELECT count(*) FROM public.orders
+                            WHERE cart_id=$1
+                            """,
+                            d.cart_id,
+                        )
+                        == 1
+                    )
+            finally:
+                await pool.close()
+
+    asyncio.run(scenario())
+
+
+def test_simulator_rolls_back_confirmation_if_placement_fails(
+    database_settings,
+    monkeypatch,
+):
+    from app.services import simulator as simulator_service
+
+    async def scenario():
+        async with committed_cart_data(database_settings, checkout_ready=True) as d:
+            pool = await asyncpg.create_pool(
+                dsn=database_settings.database_url.get_secret_value(),
+                min_size=1,
+                max_size=2,
+            )
+
+            try:
+                async with pool.acquire() as connection:
+                    session_id = await connection.fetchval(
+                        """
+                        INSERT INTO public.conversations (cart_id)
+                        VALUES ($1)
+                        RETURNING id
+                        """,
+                        d.cart_id,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE public.restaurant_settings
+                        SET kitchen_last_seen_at=clock_timestamp()
+                        WHERE id=1
+                        """
+                    )
+
+                simulator = TextSimulator(pool, session_id)
+                assert (await simulator.execute("cart")).ok
+
+                offered = await simulator.execute("quote")
+                assert offered.ok, offered.model_dump()
+                quote_id = UUID(offered.data["quote"]["quote_id"])
+
+                assert (await simulator.readback_completed(quote_id)).ok
+
+                async def fail_after_confirmation(connection, **context):
+                    assert context["quote_id"] == quote_id
+                    assert (
+                        await connection.fetchval(
+                            """
+                            SELECT confirmed_at FROM public.quotes
+                            WHERE id=$1
+                            """,
+                            quote_id,
+                        )
+                        is not None
+                    )
+                    raise asyncpg.PostgresError("Injected placement failure")
+
+                monkeypatch.setattr(
+                    simulator_service,
+                    "place_order",
+                    fail_after_confirmation,
+                )
+
+                result = await simulator.execute("yes")
+                assert result.error.code == "result_unknown"
+
+                async with pool.acquire() as connection:
+                    assert (
+                        await connection.fetchval(
+                            """
+                            SELECT confirmed_at FROM public.quotes
+                            WHERE id=$1
+                            """,
+                            quote_id,
+                        )
+                        is None
+                    )
+                    assert (
+                        await connection.fetchval(
+                            """
+                            SELECT count(*) FROM public.orders
+                            WHERE cart_id=$1
+                            """,
+                            d.cart_id,
+                        )
+                        == 0
+                    )
+            finally:
+                await pool.close()
 
     asyncio.run(scenario())

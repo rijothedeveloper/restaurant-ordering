@@ -20,6 +20,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = ["integration: requires a migrated restaurant_test database"]
