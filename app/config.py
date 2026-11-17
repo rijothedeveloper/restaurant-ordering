@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     database_url: SecretStr = Field(min_length=1)
     db_pool_min_size: int = Field(default=1, ge=1)
     db_pool_max_size: int = Field(default=5, ge=1)
+    telnyx_public_key: str | None = None
+    telnyx_account_id: str | None = None
+    telnyx_connection_id: str | None = None
+    telnyx_phone_number: str | None = None
 
     firebase_project_id: str | None = Field(
         default=None, pattern=r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$"

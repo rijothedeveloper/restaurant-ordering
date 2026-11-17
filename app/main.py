@@ -4,12 +4,13 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import firebase_admin
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.menu import router as menu_router
 from app.api.router import router
 from app.api.staff import router as staff_router
+from app.api.voice import router as voice_router
 from app.config import Settings, get_settings
 from app.db.pool import lifespan as database_lifespan
 
@@ -53,6 +54,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Temporary Telnyx diagnostic middleware
+    @app.middleware("http")
+    async def debug_telnyx_requests(
+        request: Request,
+        call_next,
+    ):
+        if request.url.path.startswith("/telnyx/"):
+            print(
+                "TELNYX DEBUG:",
+                "path=",
+                request.url.path,
+                "content_type=",
+                request.headers.get("content-type"),
+                "ed25519_present=",
+                bool(request.headers.get("telnyx-signature-ed25519")),
+                "timestamp_present=",
+                bool(request.headers.get("telnyx-timestamp")),
+                "twilio_signature_present=",
+                bool(request.headers.get("x-twilio-signature")),
+                flush=True,
+            )
+
+        response = await call_next(request)
+
+        return response
+
     app.state.settings = settings
     app.state.db_pool = None
     app.state.firebase_app = None
@@ -68,5 +95,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(router)
     app.include_router(menu_router)
     app.include_router(staff_router)
+    app.include_router(voice_router)
 
     return app
