@@ -11,8 +11,10 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from app.api.voice import router
+from app.repositories.relay import RelayRepository
 from app.repositories.voice import VoiceCall, VoiceEventConflict, VoiceRepository
 from app.services.telnyx import MAX_BODY_BYTES
 
@@ -22,6 +24,7 @@ FORM = {
     "CallSid": "v3:opaque-call-id",
     "From": "+14155550101",
     "To": "+14155550102",
+    "Direction": "inbound",
 }
 
 STATUS = {
@@ -45,7 +48,6 @@ def signed_headers(key, body, timestamp=None):
 
 @pytest.fixture
 def harness(monkeypatch):
-    # This generated private key exists only in the test.
     key = Ed25519PrivateKey.generate()
 
     app = FastAPI()
@@ -56,11 +58,22 @@ def harness(monkeypatch):
         telnyx_account_id=FORM["AccountSid"],
         telnyx_connection_id=FORM["ConnectionId"],
         telnyx_phone_number=FORM["To"],
+        telnyx_relay_url="wss://voice.example.com/telnyx/relay",
+        telnyx_relay_secret=SecretStr("test-secret-" * 4),
+        telnyx_relay_voice="Telnyx.Natural.abbie",
+        telnyx_transcription_provider="deepgram",
     )
 
     app.state.db_pool = object()
+
     recorder = AsyncMock(return_value=VoiceCall(uuid4(), "received"))
     monkeypatch.setattr(VoiceRepository, "record", recorder)
+
+    monkeypatch.setattr(
+        RelayRepository,
+        "issue",
+        AsyncMock(return_value="t" * 43),
+    )
 
     app.include_router(router)
 
@@ -74,12 +87,24 @@ def post_signed(harness, form, path="/telnyx/voice"):
     return client.post(path, content=body, headers=signed_headers(key, body))
 
 
-def test_verified_voice_greets_and_records(harness):
+def test_verified_voice_returns_relay_and_records(harness):
     response = post_signed(harness, FORM)
 
     assert response.status_code == 200
+
     root = fromstring(response.content)
-    assert [child.tag for child in root] == ["Say", "Hangup"]
+    assert [child.tag for child in root] == ["Connect", "Say", "Hangup"]
+
+    relay = root.find("Connect/ConversationRelay")
+    assert relay is not None
+    assert relay.attrib["url"] == "wss://voice.example.com/telnyx/relay"
+
+    parameter = relay.find("Parameter")
+    assert parameter is not None
+    assert parameter.attrib == {
+        "name": "relay_token",
+        "value": "t" * 43,
+    }
 
     event, kind = harness[3].await_args.args
     assert (event.call_sid, event.to_phone, kind) == (

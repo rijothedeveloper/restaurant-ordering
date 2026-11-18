@@ -23,6 +23,17 @@ RESTAURANT_ENVIRONMENT=local uv run uvicorn \
   --port 8001 \
   --reload
 
+with websockets 
+
+uv run uvicorn app.main:create_app \
+  --factory \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --reload \
+  --ws websockets-sansio \
+  --ws-max-size 16384 \
+  --ws-max-queue 16
+
 
 
 run tests
@@ -60,7 +71,7 @@ curl -i -X POST \
 
 Expect the same XML response as the local request. Keep both Uvicorn and ngrok running.
 
-ngrok http 8000 --traffic-policy-file ngrok-voice.yml
+ngrok http 8000 --url https://untimely-motor-avid.ngrok-free.dev --traffic-policy-file ngrok-voice.yml
 
 
 

@@ -41,6 +41,7 @@ PHONE_PATTERN = r"\+[1-9][0-9]{1,14}"
 
 
 class TexmlEvent(BaseModel):
+    direction: str | None = Field(default=None, alias="Direction", exclude=True)
     model_config = ConfigDict(
         extra="ignore",
         frozen=True,

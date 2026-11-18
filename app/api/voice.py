@@ -3,22 +3,17 @@ from typing import Annotated, Literal
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
 
+from app.repositories.relay import RelayRepository
 from app.repositories.voice import VoiceCall, VoiceEventConflict, VoiceRepository
 from app.schemas.voice import TERMINAL_STATUSES, TexmlEvent
+from app.services.relay import relay_configuration, serve_relay
 from app.services.telnyx import verified_texml_event
-
 
 router = APIRouter(prefix="/telnyx", tags=["voice"])
 
 VerifiedEvent = Annotated[TexmlEvent, Depends(verified_texml_event)]
-
-GREETING = (
-    "Hello. You have reached the restaurant ordering test line. "
-    "The phone connection is working. "
-    "This test line cannot take orders yet. Goodbye."
-)
 
 
 async def record_event(
@@ -63,11 +58,61 @@ def xml_response(root: Element) -> Response:
 
 @router.post("/voice", response_class=Response)
 async def incoming_voice(request: Request, event: VerifiedEvent):
-    call = await record_event(request, event, "voice")
+    settings = request.app.state.settings
+    relay_url, secret = relay_configuration(settings)
 
+    if event.direction != "inbound":
+        raise HTTPException(status_code=403, detail="Expected an inbound voice call")
+
+    # This still uses your working Lesson 2 signature dependency and persistence.
+    call = await record_event(request, event, "voice")
     root = Element("Response")
+
     if call.status not in TERMINAL_STATUSES:
-        SubElement(root, "Say", voice="man", language="en-US").text = GREETING
+        try:
+            async with asyncio.timeout(5):
+                token = await RelayRepository(request.app.state.db_pool).issue(
+                    call.id, secret
+                )
+        except (
+            asyncpg.PostgresError,
+            asyncpg.InterfaceError,
+            OSError,
+            TimeoutError,
+        ):
+            raise HTTPException(503, "Relay database is unavailable") from None
+
+        if token is not None:
+            connect = SubElement(root, "Connect")
+
+            relay = SubElement(
+                connect,
+                "ConversationRelay",
+                url=relay_url,
+                voice=settings.telnyx_relay_voice,
+                language="en",
+                transcriptionProvider=settings.telnyx_transcription_provider,
+                interruptible="any",
+                dtmfDetection="true",
+                events="speaker-events tokens-played",
+                partialPrompts="false",
+            )
+
+            # Telnyx includes this in the initial setup.customParameters.
+            SubElement(
+                relay,
+                "Parameter",
+                name="relay_token",
+                value=token,
+            )
+
+            # These instructions execute after Conversation Relay stops.
+            # SubElement(
+            #     root,
+            #     "Say",
+            #     voice=settings.telnyx_relay_voice,
+            #     language="en-US",
+            # ).text = "The voice connection test has ended. Goodbye."
 
     SubElement(root, "Hangup")
     return xml_response(root)
@@ -79,3 +124,8 @@ async def call_status(request: Request, event: VerifiedEvent):
 
     # HTTP 200 acknowledges successful persistence.
     return xml_response(Element("Response"))
+
+
+@router.websocket("/relay")
+async def conversation_relay(websocket: WebSocket):
+    await serve_relay(websocket)

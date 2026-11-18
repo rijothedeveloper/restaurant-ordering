@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     telnyx_account_id: str | None = None
     telnyx_connection_id: str | None = None
     telnyx_phone_number: str | None = None
+    telnyx_relay_url: str | None = None
+    telnyx_relay_secret: SecretStr | None = None
+
+    # Documented Telnyx voice and transcription-provider defaults.
+    telnyx_relay_voice: str = "Telnyx.Natural.abbie"
+    telnyx_transcription_provider: str = "deepgram"
 
     firebase_project_id: str | None = Field(
         default=None, pattern=r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$"

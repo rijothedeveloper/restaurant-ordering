@@ -3,6 +3,8 @@ import binascii
 import re
 import time
 from urllib.parse import parse_qsl
+import hashlib
+import logging
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -13,6 +15,17 @@ from app.schemas.voice import PHONE_PATTERN, TexmlEvent
 
 MAX_BODY_BYTES = 64 * 1024
 MAX_AGE_SECONDS = 300
+
+
+def log_call_id_tags(stage: str, values: dict, names: tuple[str, ...]) -> None:
+    tags = {}
+    for name in names:
+        value = values.get(name)
+        tags[name] = (
+            hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+            if isinstance(value, str) and value else "-"
+        )
+    logging.getLogger("uvicorn.error").info("Relay ID tags %s %s", stage, tags)
 
 
 async def verified_texml_event(request: Request) -> TexmlEvent:
@@ -90,7 +103,14 @@ async def verified_texml_event(request: Request) -> TexmlEvent:
         if len({key for key, _ in pairs}) != len(pairs):
             raise ValueError  # Duplicate fields make the payload ambiguous.
 
-        event = TexmlEvent.model_validate(dict(pairs))
+        fields = dict(pairs)
+        event = TexmlEvent.model_validate(fields)
+        if request.url.path == "/telnyx/voice":
+            log_call_id_tags(
+                "voice",
+                fields,
+                ("CallSid", "CallSidLegacy", "CallLegId", "CallSessionId"),
+            )
     except (ValueError, UnicodeError, ValidationError):
         raise HTTPException(400, "Invalid TeXML form") from None
 
